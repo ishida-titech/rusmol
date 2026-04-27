@@ -188,23 +188,25 @@ fn build_segment(
         }
     }
 
-    // ── Smooth Cα positions (strand-level undulation removal) ────────────────
-    // The β-sheet backbone has an inherent gentle wave at the strand level.
-    // Apply a 5-point Gaussian average (6 passes) to the Cα positions used
-    // as spline control points. The original positions are kept for o_dir.
+    // ── Smooth Cα positions per secondary structure ───────────────────────────
+    // Sheet: moderate smoothing removes strand-level undulation.
+    // Helix: no smoothing — the helical path is already smooth.
+    // Coil:  no smoothing — coils should follow the actual backbone.
+    //
+    // Uses a per-residue weighted blend toward the 3-point average so that
+    // only sheet Cα positions are shifted, preventing strand overlap.
     let mut ca_spline = ca_pos.clone();
-    for _ in 0..6 {
+    for _ in 0..3 {
         let prev = ca_spline.clone();
-        for i in 2..n.saturating_sub(2) {
-            ca_spline[i] = (prev[i - 2]
-                + prev[i - 1] * 4.0
-                + prev[i]     * 6.0
-                + prev[i + 1] * 4.0
-                + prev[i + 2]) * (1.0 / 16.0);
-        }
-        if n >= 3 {
-            ca_spline[1]     = (prev[0] + prev[1] * 2.0 + prev[2])     * (1.0 / 4.0);
-            ca_spline[n - 2] = (prev[n - 3] + prev[n - 2] * 2.0 + prev[n - 1]) * (1.0 / 4.0);
+        for i in 1..n - 1 {
+            let w = match ss_types[i] {
+                SecondaryStructure::Sheet => 0.25,
+                _ => 0.0,
+            };
+            if w > 0.0 {
+                let avg = (prev[i - 1] + prev[i] * 2.0 + prev[i + 1]) * 0.25;
+                ca_spline[i] = prev[i] * (1.0 - w) + avg * w;
+            }
         }
     }
 
