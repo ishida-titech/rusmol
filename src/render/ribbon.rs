@@ -188,23 +188,19 @@ fn build_segment(
         }
     }
 
-    // ── Catmull-Rom spline ────────────────────────────────────────────────────
+    // ── Catmull-Rom spline (pass 1: geometry, colour, SS) ────────────────────
     let total_pts = (n - 1) * N_SUB + 1;
     let mut spos   = Vec::with_capacity(total_pts);
     let mut stan   = Vec::with_capacity(total_pts);
-    let mut sside  = Vec::with_capacity(total_pts);
     let mut scol   = Vec::with_capacity(total_pts);
     let mut sss    = Vec::with_capacity(total_pts);
     let mut sresid = Vec::with_capacity(total_pts);
 
     for seg in 0..n - 1 {
-        let p0 = if seg > 0     { ca_pos[seg - 1]                     } else { ca_pos[0] * 2.0 - ca_pos[1] };
+        let p0 = if seg > 0     { ca_pos[seg - 1]         } else { ca_pos[0] * 2.0 - ca_pos[1] };
         let p1 = ca_pos[seg];
         let p2 = ca_pos[seg + 1];
-        let p3 = if seg + 2 < n { ca_pos[seg + 2]                     } else { ca_pos[n - 1] * 2.0 - ca_pos[n - 2] };
-
-        let o1 = o_dir[seg];
-        let o2 = o_dir[seg + 1];
+        let p3 = if seg + 2 < n { ca_pos[seg + 2]         } else { ca_pos[n - 1] * 2.0 - ca_pos[n - 2] };
 
         let steps = if seg == n - 2 { N_SUB + 1 } else { N_SUB };
         for k in 0..steps {
@@ -214,37 +210,56 @@ fn build_segment(
             let tan = catmull_rom_deriv(p0, p1, p2, p3, t);
             let tan = if tan.length_squared() > 1e-10 { tan.normalize() } else { Vec3::Y };
 
-            // Interpolated O direction → project out tangent component
-            let ov  = o1.lerp(o2, t);
-            let side = project_perp(ov, tan);
-
-            let col = lerp_color(colors[seg], colors[seg + 1], t);
-
-            // Assign residue_id from the nearer CA atom.
+            let col    = lerp_color(colors[seg], colors[seg + 1], t);
             let ca_idx = if t < 0.5 { residues[seg].2 } else { residues[seg + 1].2 };
-            sresid.push(if ca_idx < residue_ids.len() { residue_ids[ca_idx] } else { 0 });
-            let ss  = if t < 0.5 { ss_types[seg] } else { ss_types[seg + 1] };
+            let ss     = if t < 0.5 { ss_types[seg]   } else { ss_types[seg + 1] };
 
+            sresid.push(if ca_idx < residue_ids.len() { residue_ids[ca_idx] } else { 0 });
             spos.push(pos);
             stan.push(tan);
-            sside.push(side);
             scol.push(col);
             sss.push(ss);
         }
     }
 
-    // Smooth the spline-level side vectors: 6 passes of 3-point average.
-    // Even after o_dir smoothing, tangent rotation between spline points can
-    // cause the projected side vector to oscillate; this pass removes it.
-    for _ in 0..6 {
-        let prev = sside.clone();
-        for i in 1..sside.len() - 1 {
-            let avg = prev[i - 1] + prev[i] * 2.0 + prev[i + 1];
-            let s = avg.normalize_or_zero();
-            if s.length_squared() > 0.5 { sside[i] = s; }
+    // ── Pass 2: side vector via Parallel Transport + per-Cα O correction ─────
+    //
+    // Pure interpolation of O directions produces waviness because even a small
+    // oscillation in the projected side vector is amplified by the flat ribbon.
+    // Parallel transport is rotation-minimising: it only rotates the side vector
+    // as much as the tangent rotates, yielding a smooth ribbon.
+    // At each Cα position (every N_SUB steps) we snap to the smoothed O direction
+    // to prevent cumulative drift without reintroducing oscillation.
+    let m = spos.len();
+    let mut sside: Vec<Vec3> = Vec::with_capacity(m);
+    {
+        // Initialise from the first O direction
+        let mut side = project_perp(o_dir[0], stan[0]).normalize_or_zero();
+        if side.length_squared() < 0.5 { side = orthogonal_to(stan[0]); }
+
+        for i in 0..m {
+            // At each Cα boundary (except the very first point which is already set),
+            // snap the side vector to the smoothed O direction.
+            if i > 0 && i % N_SUB == 0 {
+                let seg = (i / N_SUB).min(n - 1);
+                let o_ideal = project_perp(o_dir[seg], stan[i]).normalize_or_zero();
+                if o_ideal.length_squared() > 0.5 {
+                    // Flip to maintain sign consistency with the propagated frame.
+                    side = if o_ideal.dot(side) >= 0.0 { o_ideal } else { -o_ideal };
+                }
+            }
+
+            sside.push(side);
+
+            // Parallel-transport side to the next tangent.
+            if i + 1 < m {
+                let s = project_perp(side, stan[i + 1]).normalize_or_zero();
+                if s.length_squared() > 0.5 { side = s; }
+            }
         }
+
+        // Fix any degenerate entries by inheriting from the previous point.
         for i in 1..sside.len() {
-            if sside[i].dot(sside[i - 1]) < 0.0 { sside[i] = -sside[i]; }
             if sside[i].length_squared() < 1e-10 { sside[i] = sside[i - 1]; }
         }
     }
@@ -253,7 +268,6 @@ fn build_segment(
     // Detect the last N_ARROW_STEPS spline points of each Sheet run.
     // arrow_frac[i] = -1.0  → outside arrow zone (use normal profile)
     // arrow_frac[i] ∈ [0, 1] → inside: 0 = arrowhead base (max width), 1 = tip
-    let m = spos.len();
     let mut arrow_frac: Vec<f32> = vec![-1.0; m];
     {
         let mut i = 0;
