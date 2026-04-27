@@ -188,6 +188,26 @@ fn build_segment(
         }
     }
 
+    // ── Smooth Cα positions (strand-level undulation removal) ────────────────
+    // The β-sheet backbone has an inherent gentle wave at the strand level.
+    // Apply a 5-point Gaussian average (6 passes) to the Cα positions used
+    // as spline control points. The original positions are kept for o_dir.
+    let mut ca_spline = ca_pos.clone();
+    for _ in 0..6 {
+        let prev = ca_spline.clone();
+        for i in 2..n.saturating_sub(2) {
+            ca_spline[i] = (prev[i - 2]
+                + prev[i - 1] * 4.0
+                + prev[i]     * 6.0
+                + prev[i + 1] * 4.0
+                + prev[i + 2]) * (1.0 / 16.0);
+        }
+        if n >= 3 {
+            ca_spline[1]     = (prev[0] + prev[1] * 2.0 + prev[2])     * (1.0 / 4.0);
+            ca_spline[n - 2] = (prev[n - 3] + prev[n - 2] * 2.0 + prev[n - 1]) * (1.0 / 4.0);
+        }
+    }
+
     // ── Catmull-Rom spline (pass 1: geometry, colour, SS) ────────────────────
     let total_pts = (n - 1) * N_SUB + 1;
     let mut spos   = Vec::with_capacity(total_pts);
@@ -197,10 +217,10 @@ fn build_segment(
     let mut sresid = Vec::with_capacity(total_pts);
 
     for seg in 0..n - 1 {
-        let p0 = if seg > 0     { ca_pos[seg - 1]         } else { ca_pos[0] * 2.0 - ca_pos[1] };
-        let p1 = ca_pos[seg];
-        let p2 = ca_pos[seg + 1];
-        let p3 = if seg + 2 < n { ca_pos[seg + 2]         } else { ca_pos[n - 1] * 2.0 - ca_pos[n - 2] };
+        let p0 = if seg > 0     { ca_spline[seg - 1]         } else { ca_spline[0] * 2.0 - ca_spline[1] };
+        let p1 = ca_spline[seg];
+        let p2 = ca_spline[seg + 1];
+        let p3 = if seg + 2 < n { ca_spline[seg + 2]         } else { ca_spline[n - 1] * 2.0 - ca_spline[n - 2] };
 
         let steps = if seg == n - 2 { N_SUB + 1 } else { N_SUB };
         for k in 0..steps {
