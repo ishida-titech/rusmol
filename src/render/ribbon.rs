@@ -160,6 +160,26 @@ fn build_segment(
         }
     }
 
+    // Smooth O-direction vectors with a 3-point weighted average (3 passes).
+    // β-sheet O atoms alternate up/down between residues; without smoothing
+    // the interpolated side vector oscillates and the ribbon appears wavy.
+    for _ in 0..3 {
+        let prev = o_dir.clone();
+        for i in 1..n - 1 {
+            let avg = prev[i - 1] + prev[i] * 2.0 + prev[i + 1];
+            let s = avg.normalize_or_zero();
+            if s.length_squared() > 0.5 {
+                o_dir[i] = s;
+            }
+        }
+        // Re-enforce consistency after each smoothing pass
+        for i in 1..n {
+            if o_dir[i].dot(o_dir[i - 1]) < 0.0 {
+                o_dir[i] = -o_dir[i];
+            }
+        }
+    }
+
     // ── Catmull-Rom spline ────────────────────────────────────────────────────
     let total_pts = (n - 1) * N_SUB + 1;
     let mut spos   = Vec::with_capacity(total_pts);
