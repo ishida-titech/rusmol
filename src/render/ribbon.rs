@@ -160,23 +160,31 @@ fn build_segment(
         }
     }
 
-    // Smooth O-direction vectors with a 3-point weighted average (3 passes).
-    // β-sheet O atoms alternate up/down between residues; without smoothing
-    // the interpolated side vector oscillates and the ribbon appears wavy.
-    for _ in 0..3 {
+    // Smooth O-direction vectors: 6 passes of 5-point Gaussian.
+    // β-sheet O atoms alternate up/down; without smoothing the interpolated
+    // side vector oscillates each residue and the ribbon appears wavy.
+    for _ in 0..6 {
         let prev = o_dir.clone();
-        for i in 1..n - 1 {
-            let avg = prev[i - 1] + prev[i] * 2.0 + prev[i + 1];
+        // 5-point kernel (weights 1:4:6:4:1) for interior
+        for i in 2..n.saturating_sub(2) {
+            let avg = prev[i - 2]
+                + prev[i - 1] * 4.0
+                + prev[i]     * 6.0
+                + prev[i + 1] * 4.0
+                + prev[i + 2];
             let s = avg.normalize_or_zero();
-            if s.length_squared() > 0.5 {
-                o_dir[i] = s;
-            }
+            if s.length_squared() > 0.5 { o_dir[i] = s; }
+        }
+        // 3-point kernel for positions near the ends
+        if n >= 3 {
+            let s = (prev[0] + prev[1] * 2.0 + prev[2]).normalize_or_zero();
+            if s.length_squared() > 0.5 { o_dir[1] = s; }
+            let s = (prev[n - 3] + prev[n - 2] * 2.0 + prev[n - 1]).normalize_or_zero();
+            if s.length_squared() > 0.5 { o_dir[n - 2] = s; }
         }
         // Re-enforce consistency after each smoothing pass
         for i in 1..n {
-            if o_dir[i].dot(o_dir[i - 1]) < 0.0 {
-                o_dir[i] = -o_dir[i];
-            }
+            if o_dir[i].dot(o_dir[i - 1]) < 0.0 { o_dir[i] = -o_dir[i]; }
         }
     }
 
@@ -225,14 +233,19 @@ fn build_segment(
         }
     }
 
-    // Second consistency pass on interpolated side vectors
-    for i in 1..sside.len() {
-        if sside[i].dot(sside[i - 1]) < 0.0 {
-            sside[i] = -sside[i];
+    // Smooth the spline-level side vectors: 6 passes of 3-point average.
+    // Even after o_dir smoothing, tangent rotation between spline points can
+    // cause the projected side vector to oscillate; this pass removes it.
+    for _ in 0..6 {
+        let prev = sside.clone();
+        for i in 1..sside.len() - 1 {
+            let avg = prev[i - 1] + prev[i] * 2.0 + prev[i + 1];
+            let s = avg.normalize_or_zero();
+            if s.length_squared() > 0.5 { sside[i] = s; }
         }
-        // If side is degenerate, inherit from previous
-        if sside[i].length_squared() < 1e-10 {
-            sside[i] = sside[i - 1];
+        for i in 1..sside.len() {
+            if sside[i].dot(sside[i - 1]) < 0.0 { sside[i] = -sside[i]; }
+            if sside[i].length_squared() < 1e-10 { sside[i] = sside[i - 1]; }
         }
     }
 
