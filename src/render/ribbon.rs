@@ -11,8 +11,8 @@ const N_SUB: usize = 16;
 const N_PROF: usize = 24;
 /// Maximum Cα–Cα distance (Å) before treating as a chain break.
 const BREAK_DIST: f32 = 5.0;
-/// Number of spline steps that form the β-sheet arrow (≈ last 3 Cα intervals).
-const N_ARROW_STEPS: usize = N_SUB * 3;
+/// Number of spline steps that form the β-sheet arrow (≈ last 1 Cα interval).
+const N_ARROW_STEPS: usize = N_SUB;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
