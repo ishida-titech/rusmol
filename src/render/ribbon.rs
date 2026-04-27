@@ -6,9 +6,9 @@ use crate::scene::object::REP_RIBBON;
 use crate::structure::atom::{SecondaryStructure, Structure};
 
 /// Number of Catmull-Rom sub-divisions per Cα–Cα segment.
-const N_SUB: usize = 8;
+const N_SUB: usize = 16;
 /// Number of vertices in each cross-section ring.
-const N_PROF: usize = 12;
+const N_PROF: usize = 24;
 /// Maximum Cα–Cα distance (Å) before treating as a chain break.
 const BREAK_DIST: f32 = 5.0;
 /// Number of spline steps that form the β-sheet arrow (≈ last 3 Cα intervals).
@@ -313,7 +313,7 @@ fn catmull_rom_deriv(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
 fn profile_dims(ss: SecondaryStructure) -> (f32, f32) {
     match ss {
         SecondaryStructure::Helix => (1.1, 0.40),  // rounded tube-like ellipse
-        SecondaryStructure::Sheet => (1.5, 0.20),  // thin flat ribbon (arrow handles width)
+        SecondaryStructure::Sheet => (1.4, 0.15),  // very flat ribbon → arrow contrast
         SecondaryStructure::Coil  => (0.22, 0.22),
     }
 }
