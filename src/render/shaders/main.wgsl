@@ -39,6 +39,10 @@ fn vs_main(in: VertexIn) -> VertexOut {
     return out;
 }
 
+fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
+    return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), vec3(0.0), vec3(1.0));
+}
+
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let N = normalize(in.world_normal);
@@ -52,5 +56,5 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let specular = pow(max(dot(N, H), 0.0), 64.0) * 0.55;
 
     let lit = (ambient + diffuse + specular) * u.camera_pos.w;
-    return vec4<f32>(in.color * lit, 1.0);
+    return vec4<f32>(aces_tonemap(in.color * lit), 1.0);
 }

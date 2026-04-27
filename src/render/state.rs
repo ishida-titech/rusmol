@@ -67,6 +67,10 @@ pub struct RenderState {
     pub depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
 
+    // ── MSAA × 4 ─────────────────────────────────────────────────────────────
+    msaa_texture: wgpu::Texture,
+    msaa_color_view: wgpu::TextureView,
+
     // ── Phase 5: picking ─────────────────────────────────────────────────────
     picker: Picker,
     /// Maps sphere instance index (0-based) → (object_name, atom_index)
@@ -148,7 +152,8 @@ impl RenderState {
         };
         surface.configure(&device, &config);
 
-        let (depth_texture, depth_view) = create_depth_texture(&device, &config);
+        let (depth_texture, depth_view) = create_depth_texture(&device, &config, 4);
+        let (msaa_texture, msaa_color_view) = create_msaa_color_texture(&device, &config);
 
         // ── Uniform buffer ───────────────────────────────────────────────────
         let uniforms = Uniforms::new(
@@ -206,6 +211,7 @@ impl RenderState {
             "fs_main",
             &[Vertex::desc(), SphereInstance::desc()],
             config.format,
+            4,
         );
         let (s_verts, s_indices) = crate::render::ball_stick::icosphere(2);
         let sphere_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -233,6 +239,7 @@ impl RenderState {
             "fs_main",
             &[Vertex::desc(), CylinderInstance::desc()],
             config.format,
+            4,
         );
         let (c_verts, c_indices) = crate::render::ball_stick::gen_cylinder(32);
         let cylinder_vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -283,7 +290,7 @@ impl RenderState {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
             multiview: None,
             cache: None,
         });
@@ -324,7 +331,7 @@ impl RenderState {
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState::default(),
+            multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
             multiview: None,
             cache: None,
         });
@@ -366,6 +373,8 @@ impl RenderState {
             surface_index_count: 0,
             depth_texture,
             depth_view,
+            msaa_texture,
+            msaa_color_view,
             picker,
             sphere_instance_map: Vec::new(),
             ghost_instances: None,
@@ -388,9 +397,12 @@ impl RenderState {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
-        let (dt, dv) = create_depth_texture(&self.device, &self.config);
+        let (dt, dv) = create_depth_texture(&self.device, &self.config, 4);
         self.depth_texture = dt;
         self.depth_view = dv;
+        let (mt, mv) = create_msaa_color_texture(&self.device, &self.config);
+        self.msaa_texture = mt;
+        self.msaa_color_view = mv;
         self.picker.resize(&self.device, width, height);
     }
 
@@ -724,7 +736,8 @@ impl RenderState {
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        let view = output.texture.create_view(&Default::default());
+        // Resolved (non-MSAA) surface texture — egui renders here directly.
+        let output_view = output.texture.create_view(&Default::default());
 
         // Upload any new egui textures.
         for (id, delta) in &textures_delta.set {
@@ -738,16 +751,16 @@ impl RenderState {
             &self.device, &self.queue, &mut encoder, egui_primitives, screen_desc,
         );
 
-        // ── 3-D main pass ─────────────────────────────────────────────────────
+        // ── 3-D main pass (MSAA × 4) ──────────────────────────────────────────
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("MainPass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
+                    view: &self.msaa_color_view,          // render into MSAA buffer
+                    resolve_target: Some(&output_view),   // resolve to surface
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(self.bg_color),
-                        store: wgpu::StoreOp::Store,
+                        store: wgpu::StoreOp::Discard,   // MSAA buffer not needed after resolve
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -808,7 +821,7 @@ impl RenderState {
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("EguiPass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
+                        view: &output_view,  // render onto the resolved surface
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Load,
@@ -842,6 +855,7 @@ fn build_pipeline(
     fs_entry: &str,
     buffers: &[wgpu::VertexBufferLayout<'_>],
     format: wgpu::TextureFormat,
+    sample_count: u32,
 ) -> wgpu::RenderPipeline {
     device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: None,
@@ -874,7 +888,7 @@ fn build_pipeline(
             stencil: Default::default(),
             bias: Default::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState { count: sample_count, mask: !0, alpha_to_coverage_enabled: false },
         multiview: None,
         cache: None,
     })
@@ -883,6 +897,7 @@ fn build_pipeline(
 fn create_depth_texture(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
+    sample_count: u32,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("DepthTexture"),
@@ -892,9 +907,31 @@ fn create_depth_texture(
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
+}
+
+fn create_msaa_color_texture(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("MSAAColor"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 4,
+        dimension: wgpu::TextureDimension::D2,
+        format: config.format,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });

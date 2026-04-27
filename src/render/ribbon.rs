@@ -11,6 +11,8 @@ const N_SUB: usize = 8;
 const N_PROF: usize = 12;
 /// Maximum Cα–Cα distance (Å) before treating as a chain break.
 const BREAK_DIST: f32 = 5.0;
+/// Number of spline steps that form the β-sheet arrow (≈ last 2 Cα intervals).
+const N_ARROW_STEPS: usize = N_SUB * 2;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -214,8 +216,32 @@ fn build_segment(
         }
     }
 
+    // ── β-sheet arrow zone ────────────────────────────────────────────────────
+    // Detect the last N_ARROW_STEPS spline points of each Sheet run.
+    // arrow_frac[i] ∈ (0, 1]: 0 = outside arrow, 1 = arrow tip.
+    let m = spos.len();
+    let mut arrow_frac: Vec<f32> = vec![0.0; m];
+    {
+        let mut i = 0;
+        while i < m {
+            if sss[i] == SecondaryStructure::Sheet {
+                let run_start = i;
+                while i < m && sss[i] == SecondaryStructure::Sheet { i += 1; }
+                let run_end = i;
+                let run_len = run_end - run_start;
+                let n_arrow = N_ARROW_STEPS.min(run_len / 2 + 1);
+                let arrow_start = run_end - n_arrow;
+                for j in arrow_start..run_end {
+                    let denom = (run_end - arrow_start).saturating_sub(1).max(1);
+                    arrow_frac[j] = (j - arrow_start) as f32 / denom as f32;
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     // ── Extrude cross-section profile ─────────────────────────────────────────
-    let m      = spos.len();
     let vbase  = vertices.len() as u32;
 
     for i in 0..m {
@@ -224,14 +250,21 @@ fn build_segment(
         let bi   = stan[i].cross(side).normalize_or_zero();
         let bi   = if bi.length_squared() < 1e-10 { orthogonal_to(stan[i]) } else { bi.normalize() };
         let col  = scol[i];
-        let (a, b) = profile_dims(sss[i]);
+        let (base_a, base_b) = profile_dims(sss[i]);
+        let (a, b) = if sss[i] == SecondaryStructure::Sheet && arrow_frac[i] > 0.0 {
+            arrow_profile_dims(base_a, base_b, arrow_frac[i])
+        } else {
+            (base_a, base_b)
+        };
 
         for j in 0..N_PROF {
             let angle = j as f32 * std::f32::consts::TAU / N_PROF as f32;
             let (sin_a, cos_a) = angle.sin_cos();
             let offset = side * (cos_a * a) + bi * (sin_a * b);
-            // Ellipse outward normal: proportional to (cos/a², sin/b²) but simplified to (cos/a, sin/b)
-            let normal = (side * (cos_a / a) + bi * (sin_a / b)).normalize_or_zero();
+            // Clamp semi-axes for normal to avoid division blow-up near the tip.
+            let a_n = a.max(0.08);
+            let b_n = b.max(0.08);
+            let normal = (side * (cos_a / a_n) + bi * (sin_a / b_n)).normalize_or_zero();
             vertices.push(RibbonVertex {
                 position:   (pos + offset).to_array(),
                 normal:     normal.to_array(),
@@ -275,9 +308,27 @@ fn catmull_rom_deriv(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
 /// Cross-section semi-axes (width, thickness) in Ångströms.
 fn profile_dims(ss: SecondaryStructure) -> (f32, f32) {
     match ss {
-        SecondaryStructure::Helix => (1.2, 0.35),
-        SecondaryStructure::Sheet => (1.6, 0.28),
+        SecondaryStructure::Helix => (1.1, 0.40),  // rounded tube-like ellipse
+        SecondaryStructure::Sheet => (1.5, 0.20),  // thin flat ribbon (arrow handles width)
         SecondaryStructure::Coil  => (0.22, 0.22),
+    }
+}
+
+/// Compute the cross-section semi-axes for the β-sheet arrow zone.
+/// `frac` ∈ (0, 1]: 0 = start of flare, 1 = arrow tip.
+///
+/// Shape:
+///   frac 0 → 0.65: widen from `a` to `a + 1.0` (arrow shaft flare)
+///   frac 0.65 → 1:  taper both axes to near-zero (arrow tip)
+fn arrow_profile_dims(a: f32, b: f32, frac: f32) -> (f32, f32) {
+    let flare_end = 0.65_f32;
+    if frac <= flare_end {
+        let t = frac / flare_end;
+        (a + t * 1.0, b)
+    } else {
+        let t = (frac - flare_end) / (1.0 - flare_end);
+        let a_max = a + 1.0;
+        ((1.0 - t) * a_max, ((1.0 - t) * b).max(0.02))
     }
 }
 
