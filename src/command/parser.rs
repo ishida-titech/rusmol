@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use super::selection::{parse as parse_sel, SelectionExpr};
+use super::selection::parse as parse_sel;
 use super::{ColorSpec, Command};
 use crate::scene::object::RepresentationType;
 
@@ -211,15 +211,6 @@ fn split_first_word(s: &str) -> (&str, &str) {
 
 // ── Selection helper for executor use ─────────────────────────────────────────
 
-/// Parse a selection expression string; returns all-atoms expr on empty input.
-pub fn parse_sel_or_all(s: &str) -> Result<SelectionExpr, String> {
-    let s = s.trim();
-    if s.is_empty() {
-        Ok(SelectionExpr::All)
-    } else {
-        parse_sel(s)
-    }
-}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

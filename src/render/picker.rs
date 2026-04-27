@@ -1,5 +1,3 @@
-use wgpu::util::DeviceExt;
-
 use crate::render::ball_stick::{SphereInstance, Vertex};
 
 /// Pixel radius for nearest-neighbor ghost-sphere search (Ribbon / Surface picking).

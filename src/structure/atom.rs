@@ -25,7 +25,6 @@ pub struct Atom {
     pub alt_loc: Option<char>,
     pub residue: ResidueId,
     pub position: Vec3,
-    pub occupancy: f32,
     pub temp_factor: f32,
     /// Element symbol, uppercase (e.g. "C", "N", "CA" for calcium)
     pub element: String,

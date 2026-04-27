@@ -304,7 +304,6 @@ fn parse_atom_line(line: &str, is_hetatm: bool) -> Result<Atom> {
         .parse()
         .with_context(|| format!("bad z coord in: {}", line))?;
 
-    let occupancy: f32 = col(54, 60).trim().parse().unwrap_or(1.0);
     let temp_factor: f32 = col(60, 66).trim().parse().unwrap_or(0.0);
 
     let element = {
@@ -338,7 +337,6 @@ fn parse_atom_line(line: &str, is_hetatm: bool) -> Result<Atom> {
             name: resname,
         },
         position: Vec3::new(x, y, z),
-        occupancy,
         temp_factor,
         element,
         is_hetatm,

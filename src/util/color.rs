@@ -42,29 +42,6 @@ pub fn vdw_radius(element: &str) -> f32 {
     }
 }
 
-/// Covalent radius in Angstroms (for bond detection)
-pub fn covalent_radius(element: &str) -> f32 {
-    match element.trim().to_uppercase().as_str() {
-        "H"  => 0.31,
-        "C"  => 0.76,
-        "N"  => 0.71,
-        "O"  => 0.66,
-        "S"  => 1.05,
-        "P"  => 1.07,
-        "F"  => 0.57,
-        "CL" => 1.02,
-        "BR" => 1.20,
-        "I"  => 1.39,
-        "FE" => 1.32,
-        "ZN" => 1.22,
-        "MG" => 1.41,
-        "CA" => 1.76,
-        "MN" => 1.50,
-        "CU" => 1.32,
-        _    => 0.77,
-    }
-}
-
 /// Secondary structure colors (PyMOL-like defaults)
 pub fn ss_color(ss: crate::structure::atom::SecondaryStructure) -> [f32; 3] {
     use crate::structure::atom::SecondaryStructure;
