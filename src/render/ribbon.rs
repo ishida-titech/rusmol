@@ -314,6 +314,23 @@ fn build_segment(
         }
     }
 
+    // ── Smooth cross-section profile dims across SS transitions ──────────────
+    // profile_dims() returns discrete values per SS type, causing staircase
+    // width changes at helix/sheet/coil boundaries.  Pre-compute per-point
+    // (a, b) values and apply a Gaussian blur so transitions are gradual.
+    // Arrow-zone points are excluded from smoothing (handled separately).
+    let mut prof_a: Vec<f32> = sss.iter().map(|&ss| profile_dims(ss).0).collect();
+    let mut prof_b: Vec<f32> = sss.iter().map(|&ss| profile_dims(ss).1).collect();
+    for _ in 0..6 {
+        let pa = prof_a.clone();
+        let pb = prof_b.clone();
+        for i in 1..m - 1 {
+            if arrow_frac[i] >= 0.0 { continue; } // keep arrow zone sharp
+            prof_a[i] = (pa[i - 1] + pa[i] * 2.0 + pa[i + 1]) * 0.25;
+            prof_b[i] = (pb[i - 1] + pb[i] * 2.0 + pb[i + 1]) * 0.25;
+        }
+    }
+
     // ── Extrude cross-section profile ─────────────────────────────────────────
     let vbase  = vertices.len() as u32;
 
@@ -323,11 +340,10 @@ fn build_segment(
         let bi   = stan[i].cross(side).normalize_or_zero();
         let bi   = if bi.length_squared() < 1e-10 { orthogonal_to(stan[i]) } else { bi.normalize() };
         let col  = scol[i];
-        let (base_a, base_b) = profile_dims(sss[i]);
         let (a, b) = if arrow_frac[i] >= 0.0 {
-            arrow_profile_dims(base_a, base_b, arrow_frac[i])
+            arrow_profile_dims(prof_a[i], prof_b[i], arrow_frac[i])
         } else {
-            (base_a, base_b)
+            (prof_a[i], prof_b[i])
         };
 
         for j in 0..N_PROF {
