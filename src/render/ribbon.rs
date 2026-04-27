@@ -314,20 +314,38 @@ fn build_segment(
         }
     }
 
-    // ── Smooth cross-section profile dims across SS transitions ──────────────
-    // profile_dims() returns discrete values per SS type, causing staircase
-    // width changes at helix/sheet/coil boundaries.  Pre-compute per-point
-    // (a, b) values and apply a Gaussian blur so transitions are gradual.
-    // Arrow-zone points are excluded from smoothing (handled separately).
+    // ── Smooth cross-section profile dims at SS transitions ──────────────────
+    // Within each SS region the width must be exactly constant.  Only at
+    // SS boundaries do we interpolate, using a cubic smoothstep over
+    // ±TRANSITION_HALF spline points centred on the boundary.
     let mut prof_a: Vec<f32> = sss.iter().map(|&ss| profile_dims(ss).0).collect();
     let mut prof_b: Vec<f32> = sss.iter().map(|&ss| profile_dims(ss).1).collect();
-    for _ in 0..6 {
-        let pa = prof_a.clone();
-        let pb = prof_b.clone();
-        for i in 1..m - 1 {
-            if arrow_frac[i] >= 0.0 { continue; } // keep arrow zone sharp
-            prof_a[i] = (pa[i - 1] + pa[i] * 2.0 + pa[i + 1]) * 0.25;
-            prof_b[i] = (pb[i - 1] + pb[i] * 2.0 + pb[i + 1]) * 0.25;
+    {
+        let tr_half = N_SUB; // half-width of blend zone (≈1 Cα interval)
+
+        // Collect boundary positions where SS type changes
+        let bnd: Vec<usize> = (1..m).filter(|&i| sss[i] != sss[i - 1]).collect();
+
+        for (bi, &b) in bnd.iter().enumerate() {
+            let (a_l, b_l) = profile_dims(sss[b - 1]);
+            let (a_r, b_r) = profile_dims(sss[b]);
+
+            // Clamp zone to midpoints between adjacent boundaries to prevent overlap
+            let left_limit  = if bi > 0            { (bnd[bi - 1] + b) / 2 } else { 0 };
+            let right_limit = if bi + 1 < bnd.len() { (b + bnd[bi + 1]) / 2 } else { m };
+
+            let start = b.saturating_sub(tr_half).max(left_limit);
+            let end   = (b + tr_half).min(m).min(right_limit);
+            if end <= start { continue; }
+
+            let span = (end - start).max(1) as f32;
+            for j in start..end {
+                if arrow_frac[j] >= 0.0 { continue; } // keep arrow zone intact
+                let t = (j - start) as f32 / span;
+                let s = t * t * (3.0 - 2.0 * t); // smoothstep
+                prof_a[j] = a_l + (a_r - a_l) * s;
+                prof_b[j] = b_l + (b_r - b_l) * s;
+            }
         }
     }
 
