@@ -11,8 +11,8 @@ const N_SUB: usize = 8;
 const N_PROF: usize = 12;
 /// Maximum Cα–Cα distance (Å) before treating as a chain break.
 const BREAK_DIST: f32 = 5.0;
-/// Number of spline steps that form the β-sheet arrow (≈ last 2 Cα intervals).
-const N_ARROW_STEPS: usize = N_SUB * 2;
+/// Number of spline steps that form the β-sheet arrow (≈ last 3 Cα intervals).
+const N_ARROW_STEPS: usize = N_SUB * 3;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -218,9 +218,10 @@ fn build_segment(
 
     // ── β-sheet arrow zone ────────────────────────────────────────────────────
     // Detect the last N_ARROW_STEPS spline points of each Sheet run.
-    // arrow_frac[i] ∈ (0, 1]: 0 = outside arrow, 1 = arrow tip.
+    // arrow_frac[i] = -1.0  → outside arrow zone (use normal profile)
+    // arrow_frac[i] ∈ [0, 1] → inside: 0 = arrowhead base (max width), 1 = tip
     let m = spos.len();
-    let mut arrow_frac: Vec<f32> = vec![0.0; m];
+    let mut arrow_frac: Vec<f32> = vec![-1.0; m];
     {
         let mut i = 0;
         while i < m {
@@ -229,11 +230,14 @@ fn build_segment(
                 while i < m && sss[i] == SecondaryStructure::Sheet { i += 1; }
                 let run_end = i;
                 let run_len = run_end - run_start;
-                let n_arrow = N_ARROW_STEPS.min(run_len / 2 + 1);
-                let arrow_start = run_end - n_arrow;
-                for j in arrow_start..run_end {
-                    let denom = (run_end - arrow_start).saturating_sub(1).max(1);
-                    arrow_frac[j] = (j - arrow_start) as f32 / denom as f32;
+                // Arrow covers the last N_ARROW_STEPS, but at most 60% of the run.
+                let n_arrow = N_ARROW_STEPS.min(run_len * 3 / 5 + 1);
+                if n_arrow >= 2 {
+                    let arrow_start = run_end - n_arrow;
+                    let denom = (n_arrow - 1).max(1);
+                    for j in arrow_start..run_end {
+                        arrow_frac[j] = (j - arrow_start) as f32 / denom as f32;
+                    }
                 }
             } else {
                 i += 1;
@@ -251,7 +255,7 @@ fn build_segment(
         let bi   = if bi.length_squared() < 1e-10 { orthogonal_to(stan[i]) } else { bi.normalize() };
         let col  = scol[i];
         let (base_a, base_b) = profile_dims(sss[i]);
-        let (a, b) = if sss[i] == SecondaryStructure::Sheet && arrow_frac[i] > 0.0 {
+        let (a, b) = if arrow_frac[i] >= 0.0 {
             arrow_profile_dims(base_a, base_b, arrow_frac[i])
         } else {
             (base_a, base_b)
@@ -315,21 +319,15 @@ fn profile_dims(ss: SecondaryStructure) -> (f32, f32) {
 }
 
 /// Compute the cross-section semi-axes for the β-sheet arrow zone.
-/// `frac` ∈ (0, 1]: 0 = start of flare, 1 = arrow tip.
+/// `frac` ∈ [0, 1]: 0 = arrowhead base (maximum width), 1 = tip (zero width).
 ///
-/// Shape:
-///   frac 0 → 0.65: widen from `a` to `a + 1.0` (arrow shaft flare)
-///   frac 0.65 → 1:  taper both axes to near-zero (arrow tip)
+/// Shape: pure triangular arrowhead — width = max_width × (1 − frac).
+/// This produces the classic PyMOL-style β-arrow when viewed from above.
 fn arrow_profile_dims(a: f32, b: f32, frac: f32) -> (f32, f32) {
-    let flare_end = 0.65_f32;
-    if frac <= flare_end {
-        let t = frac / flare_end;
-        (a + t * 1.0, b)
-    } else {
-        let t = (frac - flare_end) / (1.0 - flare_end);
-        let a_max = a + 1.0;
-        ((1.0 - t) * a_max, ((1.0 - t) * b).max(0.02))
-    }
+    let max_a = a + 1.2;     // arrowhead base width (e.g. 1.5 + 1.2 = 2.7 Å)
+    let new_a = (max_a * (1.0 - frac)).max(0.02);
+    let new_b = (b * (1.0 - frac * 0.5)).max(0.02); // thickness tapers half as fast
+    (new_a, new_b)
 }
 
 /// Project `v` perpendicular to `axis`; returns Vec3::ZERO if degenerate.
