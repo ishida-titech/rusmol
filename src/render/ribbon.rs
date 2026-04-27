@@ -312,8 +312,8 @@ fn catmull_rom_deriv(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
 /// Cross-section semi-axes (width, thickness) in Ångströms.
 fn profile_dims(ss: SecondaryStructure) -> (f32, f32) {
     match ss {
-        SecondaryStructure::Helix => (1.1, 0.40),  // rounded tube-like ellipse
-        SecondaryStructure::Sheet => (1.4, 0.15),  // very flat ribbon → arrow contrast
+        SecondaryStructure::Helix => (0.9, 0.70),  // near-circular tube (a:b ≈ 1.3)
+        SecondaryStructure::Sheet => (1.6, 0.10),  // very flat ribbon → arrow contrast
         SecondaryStructure::Coil  => (0.22, 0.22),
     }
 }
