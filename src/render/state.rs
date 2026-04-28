@@ -35,6 +35,8 @@ pub struct RenderState {
 
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
+    #[allow(dead_code)]
+    uniform_bind_group_layout: wgpu::BindGroupLayout,
 
     // ── Sphere pipeline ──────────────────────────────────────────────────────
     sphere_pipeline: wgpu::RenderPipeline,
@@ -58,18 +60,57 @@ pub struct RenderState {
     ribbon_ib: Option<wgpu::Buffer>,
     ribbon_index_count: u32,
 
-    // ── Surface pipeline ─────────────────────────────────────────────────────
-    surface_pipeline: wgpu::RenderPipeline,
+    // ── Surface OIT pipeline ──────────────────────────────────────────────────
+    surface_oit_pipeline: wgpu::RenderPipeline,
     surface_vb: Option<wgpu::Buffer>,
     surface_ib: Option<wgpu::Buffer>,
     surface_index_count: u32,
 
+    // ── MSAA depth (multisampled) ─────────────────────────────────────────────
     pub depth_texture: wgpu::Texture,
     pub depth_view: wgpu::TextureView,
 
-    // ── MSAA × 4 ─────────────────────────────────────────────────────────────
+    // ── MSAA × 4 color ───────────────────────────────────────────────────────
     msaa_texture: wgpu::Texture,
     msaa_color_view: wgpu::TextureView,
+
+    // ── Opaque scene resolve target (Rgba16Float, sample_count=1) ─────────────
+    scene_color_tex: wgpu::Texture,
+    scene_color_view: wgpu::TextureView,
+
+    // ── Single-sample depth for post-process sampling ─────────────────────────
+    depth_single_tex: wgpu::Texture,
+    depth_single_view: wgpu::TextureView,
+
+    // ── OIT textures ──────────────────────────────────────────────────────────
+    oit_accum_tex: wgpu::Texture,
+    oit_accum_view: wgpu::TextureView,
+    oit_reveal_tex: wgpu::Texture,
+    oit_reveal_view: wgpu::TextureView,
+
+    // ── SSAO texture ──────────────────────────────────────────────────────────
+    ssao_tex: wgpu::Texture,
+    ssao_view: wgpu::TextureView,
+
+    // ── Post-process pipelines ────────────────────────────────────────────────
+    depth_resolve_pipeline: wgpu::RenderPipeline,
+    ssao_pipeline: wgpu::RenderPipeline,
+    post_pipeline: wgpu::RenderPipeline,
+
+    // ── Depth resolve bind group ──────────────────────────────────────────────
+    depth_resolve_bgl: wgpu::BindGroupLayout,
+    depth_resolve_bg: wgpu::BindGroup,
+
+    // ── SSAO bind group ───────────────────────────────────────────────────────
+    ssao_bgl: wgpu::BindGroupLayout,
+    ssao_bg: wgpu::BindGroup,
+
+    // ── Post bind group ───────────────────────────────────────────────────────
+    post_bgl: wgpu::BindGroupLayout,
+    post_bg: wgpu::BindGroup,
+
+    // ── Shared sampler ────────────────────────────────────────────────────────
+    linear_sampler: wgpu::Sampler,
 
     // ── Phase 5: picking ─────────────────────────────────────────────────────
     picker: Picker,
@@ -77,17 +118,14 @@ pub struct RenderState {
     sphere_instance_map: Vec<AtomRef>,
 
     /// Ghost spheres: invisible in main pass, used for Ribbon/Surface picking.
-    /// Contains all non-HETATM, non-water atoms from objects with Ribbon or Surface active.
     ghost_instances: Option<wgpu::Buffer>,
     ghost_instance_count: u32,
     ghost_instance_map: Vec<AtomRef>,
 
     /// Per-object residue_id arrays: maps atom index → residue identifier.
-    /// Built in upload_scene, used by pick_at and highlight logic.
     residue_ids_cache: HashMap<String, Vec<u32>>,
 
     /// Currently highlighted residue_id (0 = no highlight).
-    /// Written to the GPU uniform on every update_uniforms call.
     picked_residue_id: u32,
 
     pub bg_color: wgpu::Color,
@@ -99,7 +137,7 @@ pub struct RenderState {
     /// Light azimuth angle in degrees clockwise from forward (default 20.0).
     pub light_azimuth_deg: f32,
 
-    /// egui overlay renderer (draws toolbar on top of the 3-D scene).
+    /// egui overlay renderer.
     pub egui_renderer: egui_wgpu::Renderer,
 }
 
@@ -152,16 +190,50 @@ impl RenderState {
         };
         surface.configure(&device, &config);
 
+        // MSAA depth (multisampled) — also has TEXTURE_BINDING for depth resolve
         let (depth_texture, depth_view) = create_depth_texture(&device, &config, 4);
+        // MSAA color (Rgba16Float × 4) — resolve target is scene_color_tex
         let (msaa_texture, msaa_color_view) = create_msaa_color_texture(&device, &config);
+        // Single-sample opaque scene resolve target
+        let (scene_color_tex, scene_color_view) = create_rgba16float_texture(
+            &device, &config, 1,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            "SceneColor",
+        );
+        // Single-sample depth for SSAO / OIT / post
+        let (depth_single_tex, depth_single_view) = create_depth_single_texture(&device, &config);
+        // OIT textures
+        let (oit_accum_tex, oit_accum_view) = create_rgba16float_texture(
+            &device, &config, 1,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            "OITAccum",
+        );
+        let (oit_reveal_tex, oit_reveal_view) = create_r16float_texture(&device, &config);
+        // SSAO texture
+        let (ssao_tex, ssao_view) = create_r8unorm_texture(&device, &config);
+
+        // ── Shared sampler ───────────────────────────────────────────────────
+        let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("LinearSampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
 
         // ── Uniform buffer ───────────────────────────────────────────────────
+        let screen_size = [config.width as f32, config.height as f32];
         let uniforms = Uniforms::new(
+            glam::Mat4::IDENTITY,
             glam::Mat4::IDENTITY,
             glam::Vec3::new(1.0, 1.0, 1.0),
             glam::Vec3::new(0.0, 0.0, 5.0),
             0,
             1.0,
+            screen_size,
         );
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniforms"),
@@ -169,7 +241,7 @@ impl RenderState {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        let uniform_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("UniformBGL"),
             entries: &[wgpu::BindGroupLayoutEntry {
                 binding: 0,
@@ -185,7 +257,7 @@ impl RenderState {
 
         let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("UniformBG"),
-            layout: &bind_group_layout,
+            layout: &uniform_bind_group_layout,
             entries: &[wgpu::BindGroupEntry {
                 binding: 0,
                 resource: uniform_buffer.as_entire_binding(),
@@ -194,11 +266,11 @@ impl RenderState {
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("PipelineLayout"),
-            bind_group_layouts: &[&bind_group_layout],
+            bind_group_layouts: &[&uniform_bind_group_layout],
             push_constant_ranges: &[],
         });
 
-        // ── Sphere pipeline ──────────────────────────────────────────────────
+        // ── Sphere pipeline (Rgba16Float, MSAA×4) ────────────────────────────
         let sphere_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SphereShader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/main.wgsl").into()),
@@ -210,7 +282,7 @@ impl RenderState {
             "vs_main",
             "fs_main",
             &[Vertex::desc(), SphereInstance::desc()],
-            config.format,
+            wgpu::TextureFormat::Rgba16Float,
             4,
         );
         let (s_verts, s_indices) = crate::render::ball_stick::icosphere(2);
@@ -226,7 +298,7 @@ impl RenderState {
         });
         let sphere_index_count = s_indices.len() as u32;
 
-        // ── Cylinder pipeline ────────────────────────────────────────────────
+        // ── Cylinder pipeline (Rgba16Float, MSAA×4) ──────────────────────────
         let cyl_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("CylShader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/cylinder.wgsl").into()),
@@ -238,7 +310,7 @@ impl RenderState {
             "vs_main",
             "fs_main",
             &[Vertex::desc(), CylinderInstance::desc()],
-            config.format,
+            wgpu::TextureFormat::Rgba16Float,
             4,
         );
         let (c_verts, c_indices) = crate::render::ball_stick::gen_cylinder(32);
@@ -254,7 +326,7 @@ impl RenderState {
         });
         let cylinder_index_count = c_indices.len() as u32;
 
-        // ── Ribbon pipeline ──────────────────────────────────────────────────
+        // ── Ribbon pipeline (Rgba16Float, MSAA×4) ────────────────────────────
         let ribbon_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("RibbonShader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/ribbon.wgsl").into()),
@@ -273,7 +345,7 @@ impl RenderState {
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
+                    format: wgpu::TextureFormat::Rgba16Float,
                     blend: Some(wgpu::BlendState::REPLACE),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -295,13 +367,13 @@ impl RenderState {
             cache: None,
         });
 
-        // ── Surface pipeline ─────────────────────────────────────────────────
+        // ── Surface OIT pipeline (non-MSAA, dual render targets) ─────────────
         let surface_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SurfaceShader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/surface.wgsl").into()),
         });
-        let surface_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("SurfacePipeline"),
+        let surface_oit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("SurfaceOITPipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &surface_shader,
@@ -313,11 +385,42 @@ impl RenderState {
                 module: &surface_shader,
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
+                targets: &[
+                    // target[0]: OIT accum (Rgba16Float), additive blend
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::One,
+                                dst_factor: wgpu::BlendFactor::One,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    // target[1]: OIT reveal (R16Float), multiply blend: dst * (1 - src.a)
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::R16Float,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Zero,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                            alpha: wgpu::BlendComponent {
+                                src_factor: wgpu::BlendFactor::Zero,
+                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                operation: wgpu::BlendOperation::Add,
+                            },
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                ],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
@@ -326,22 +429,250 @@ impl RenderState {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
+                depth_write_enabled: false,
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
             multiview: None,
             cache: None,
         });
 
+        // ── Depth resolve pipeline ────────────────────────────────────────────
+        let depth_resolve_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("DepthResolveBGL"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: true,
+                },
+                count: None,
+            }],
+        });
+        let depth_resolve_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("DepthResolvePipelineLayout"),
+            bind_group_layouts: &[&depth_resolve_bgl],
+            push_constant_ranges: &[],
+        });
+        let depth_resolve_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("DepthResolveShader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/depth_resolve.wgsl").into()),
+        });
+        let depth_resolve_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("DepthResolvePipeline"),
+            layout: Some(&depth_resolve_layout),
+            vertex: wgpu::VertexState {
+                module: &depth_resolve_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &depth_resolve_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Always,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+            cache: None,
+        });
+
+        let depth_resolve_bg = create_depth_resolve_bg(&device, &depth_resolve_bgl, &depth_view);
+
+        // ── SSAO pipeline ─────────────────────────────────────────────────────
+        let ssao_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("SSAOBGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let ssao_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("SSAOPipelineLayout"),
+            bind_group_layouts: &[&uniform_bind_group_layout, &ssao_bgl],
+            push_constant_ranges: &[],
+        });
+        let ssao_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("SSAOShader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/ssao.wgsl").into()),
+        });
+        let ssao_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("SSAOPipeline"),
+            layout: Some(&ssao_layout),
+            vertex: wgpu::VertexState {
+                module: &ssao_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &ssao_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+            cache: None,
+        });
+
+        let ssao_bg = create_ssao_bg(&device, &ssao_bgl, &depth_single_view, &linear_sampler);
+
+        // ── Post pipeline ─────────────────────────────────────────────────────
+        let post_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("PostBGL"),
+            entries: &[
+                // scene_tex
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // accum_tex
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // reveal_tex
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // ssao_tex
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // depth_tex
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // lin_samp
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let post_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("PostPipelineLayout"),
+            bind_group_layouts: &[&uniform_bind_group_layout, &post_bgl],
+            push_constant_ranges: &[],
+        });
+        let post_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("PostShader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/post.wgsl").into()),
+        });
+        let post_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("PostPipeline"),
+            layout: Some(&post_layout),
+            vertex: wgpu::VertexState {
+                module: &post_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &post_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+            cache: None,
+        });
+
+        let post_bg = create_post_bg(
+            &device, &post_bgl,
+            &scene_color_view, &oit_accum_view, &oit_reveal_view,
+            &ssao_view, &depth_single_view, &linear_sampler,
+        );
+
         // ── Phase 5: picker ──────────────────────────────────────────────────
-        let picker = Picker::new(&device, size.width.max(1), size.height.max(1), &bind_group_layout);
+        let picker = Picker::new(&device, size.width.max(1), size.height.max(1), &uniform_bind_group_layout);
 
         // ── egui renderer ────────────────────────────────────────────────────
-        // Renders the UI toolbar overlay on top of the 3-D scene.
-        // No depth buffer needed for 2-D overlay; no MSAA.
         let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
 
         Ok(Self {
@@ -351,6 +682,7 @@ impl RenderState {
             config,
             uniform_buffer,
             uniform_bind_group,
+            uniform_bind_group_layout,
             sphere_pipeline,
             sphere_vb,
             sphere_ib,
@@ -367,7 +699,7 @@ impl RenderState {
             ribbon_vb: None,
             ribbon_ib: None,
             ribbon_index_count: 0,
-            surface_pipeline,
+            surface_oit_pipeline,
             surface_vb: None,
             surface_ib: None,
             surface_index_count: 0,
@@ -375,6 +707,26 @@ impl RenderState {
             depth_view,
             msaa_texture,
             msaa_color_view,
+            scene_color_tex,
+            scene_color_view,
+            depth_single_tex,
+            depth_single_view,
+            oit_accum_tex,
+            oit_accum_view,
+            oit_reveal_tex,
+            oit_reveal_view,
+            ssao_tex,
+            ssao_view,
+            depth_resolve_pipeline,
+            ssao_pipeline,
+            post_pipeline,
+            depth_resolve_bgl,
+            depth_resolve_bg,
+            ssao_bgl,
+            ssao_bg,
+            post_bgl,
+            post_bg,
+            linear_sampler,
             picker,
             sphere_instance_map: Vec::new(),
             ghost_instances: None,
@@ -397,12 +749,52 @@ impl RenderState {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+
         let (dt, dv) = create_depth_texture(&self.device, &self.config, 4);
         self.depth_texture = dt;
         self.depth_view = dv;
+
         let (mt, mv) = create_msaa_color_texture(&self.device, &self.config);
         self.msaa_texture = mt;
         self.msaa_color_view = mv;
+
+        let (sct, scv) = create_rgba16float_texture(
+            &self.device, &self.config, 1,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            "SceneColor",
+        );
+        self.scene_color_tex = sct;
+        self.scene_color_view = scv;
+
+        let (dst, dsv) = create_depth_single_texture(&self.device, &self.config);
+        self.depth_single_tex = dst;
+        self.depth_single_view = dsv;
+
+        let (oat, oav) = create_rgba16float_texture(
+            &self.device, &self.config, 1,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            "OITAccum",
+        );
+        self.oit_accum_tex = oat;
+        self.oit_accum_view = oav;
+
+        let (ort, orv) = create_r16float_texture(&self.device, &self.config);
+        self.oit_reveal_tex = ort;
+        self.oit_reveal_view = orv;
+
+        let (st, sv) = create_r8unorm_texture(&self.device, &self.config);
+        self.ssao_tex = st;
+        self.ssao_view = sv;
+
+        // Recreate bind groups (views have changed)
+        self.depth_resolve_bg = create_depth_resolve_bg(&self.device, &self.depth_resolve_bgl, &self.depth_view);
+        self.ssao_bg = create_ssao_bg(&self.device, &self.ssao_bgl, &self.depth_single_view, &self.linear_sampler);
+        self.post_bg = create_post_bg(
+            &self.device, &self.post_bgl,
+            &self.scene_color_view, &self.oit_accum_view, &self.oit_reveal_view,
+            &self.ssao_view, &self.depth_single_view, &self.linear_sampler,
+        );
+
         self.picker.resize(&self.device, width, height);
     }
 
@@ -428,8 +820,6 @@ impl RenderState {
             self.residue_ids_cache.insert(obj_name.clone(), residue_ids);
 
             // ── Ball-and-stick ────────────────────────────────────────────────
-            // Draw a sphere for each atom that has REP_BALL_STICK set.
-            // Draw a bond only when both endpoints have REP_BALL_STICK set.
             for (i, atom) in atoms.iter().enumerate() {
                 if obj.atom_rep_show.get(i).copied().unwrap_or(0) & REP_BALL_STICK == 0 {
                     continue;
@@ -476,7 +866,6 @@ impl RenderState {
 
             // ── Backbone (Cα trace) ───────────────────────────────────────────
             if obj.has_representation(RepresentationType::Backbone) {
-                // Collect Cα atoms per chain, sorted by (seq_num, ins_code)
                 let mut ca_by_chain: HashMap<char, Vec<(i32, Option<char>, usize)>> =
                     HashMap::new();
                 for (i, atom) in atoms.iter().enumerate() {
@@ -490,7 +879,6 @@ impl RenderState {
                 }
                 for chain_cas in ca_by_chain.values_mut() {
                     chain_cas.sort_unstable_by_key(|&(seq, ins, _)| (seq, ins));
-                    // Joint spheres at each Cα
                     for &(_, _, i) in chain_cas.iter() {
                         sphere_map.push((obj_name.clone(), i));
                         spheres.push(SphereInstance {
@@ -500,7 +888,6 @@ impl RenderState {
                             _pad: 0.0,
                         });
                     }
-                    // Tube segments between consecutive Cα atoms
                     for window in chain_cas.windows(2) {
                         let (_, _, i1) = window[0];
                         let (_, _, i2) = window[1];
@@ -515,8 +902,6 @@ impl RenderState {
         }
 
         // ── Ghost spheres for Ribbon / Surface picking ────────────────────────
-        // All non-HETATM non-water atoms from objects that have Ribbon or Surface active.
-        // Rendered only in the pick pass (invisible in main pass).
         let mut ghost_spheres: Vec<SphereInstance> = Vec::new();
         let mut ghost_map: Vec<AtomRef> = Vec::new();
         for (obj_name, obj) in scene.iter() {
@@ -534,8 +919,6 @@ impl RenderState {
                 if is_water {
                     continue;
                 }
-                // For ribbon-only atoms, restrict ghost spheres to backbone atoms
-                // so picking matches what the ribbon visually represents.
                 if atom_has_ribbon && !atom_has_surface {
                     let name = atom.name.trim();
                     if !matches!(name, "N" | "CA" | "C" | "O") {
@@ -546,7 +929,7 @@ impl RenderState {
                 ghost_spheres.push(SphereInstance {
                     position: atom.position.to_array(),
                     radius: vdw_radius(&atom.element),
-                    color: [0.0, 0.0, 0.0], // color unused in pick pass
+                    color: [0.0, 0.0, 0.0],
                     _pad: 0.0,
                 });
             }
@@ -633,6 +1016,7 @@ impl RenderState {
     pub fn update_uniforms(&self, camera: &Camera) {
         let view  = camera.view_matrix();
         let proj  = camera.projection_matrix();
+        let inv_proj = proj.inverse();
         // Compute light direction from elevation/azimuth angles in camera space.
         let az = self.light_azimuth_deg.to_radians();
         let el = self.light_elevation_deg.to_radians();
@@ -642,12 +1026,15 @@ impl RenderState {
             el.cos() * az.cos(),
         );
         let light_dir = camera.rotation * light_base;
+        let screen_size = [self.config.width as f32, self.config.height as f32];
         let uniforms = Uniforms::new(
             proj * view,
+            inv_proj,
             light_dir,
             camera.eye_position(),
             self.picked_residue_id,
             self.light_intensity,
+            screen_size,
         );
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -672,10 +1059,6 @@ impl RenderState {
     }
 
     /// Perform a color-ID pick at physical pixel (px, py).
-    ///
-    /// Phase 1 — exact pixel hit on rendered spheres (BallAndStick) → `PickResult::Atom`.
-    /// Phase 2 — nearest-search on ghost spheres within `GHOST_PICK_RADIUS` pixels
-    ///            (Ribbon / Surface) → `PickResult::Residue`.
     pub fn pick_at(&self, px: u32, py: u32) -> Option<PickResult> {
         // Phase 1: exact hit on render spheres (atom-level).
         if let Some(instances) = &self.sphere_instances {
@@ -736,7 +1119,7 @@ impl RenderState {
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => return Ok(()),
             Err(e) => return Err(e.into()),
         };
-        // Resolved (non-MSAA) surface texture — egui renders here directly.
+        // Final sRGB surface texture — post composite and egui render here.
         let output_view = output.texture.create_view(&Default::default());
 
         // Upload any new egui textures.
@@ -751,16 +1134,18 @@ impl RenderState {
             &self.device, &self.queue, &mut encoder, egui_primitives, screen_desc,
         );
 
-        // ── 3-D main pass (MSAA × 4) ──────────────────────────────────────────
+        // ── Pass 1: Opaque MSAA pass (Rgba16Float) ────────────────────────────
+        // Renders sphere/cylinder/ribbon → msaa_color_view (MSAA×4)
+        // Resolves to scene_color_view (sample_count=1)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("MainPass"),
+                label: Some("OpaquePass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.msaa_color_view,          // render into MSAA buffer
-                    resolve_target: Some(&output_view),   // resolve to surface
+                    view: &self.msaa_color_view,
+                    resolve_target: Some(&self.scene_color_view),
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(self.bg_color),
-                        store: wgpu::StoreOp::Discard,   // MSAA buffer not needed after resolve
+                        store: wgpu::StoreOp::Discard,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
@@ -793,15 +1178,6 @@ impl RenderState {
                 pass.draw_indexed(0..self.ribbon_index_count, 0, 0..1);
             }
 
-            // Draw surface
-            if let (Some(vb), Some(ib)) = (&self.surface_vb, &self.surface_ib) {
-                pass.set_pipeline(&self.surface_pipeline);
-                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.surface_index_count, 0, 0..1);
-            }
-
             // Draw spheres on top
             if let Some(buf) = &self.sphere_instances {
                 pass.set_pipeline(&self.sphere_pipeline);
@@ -813,15 +1189,119 @@ impl RenderState {
             }
         }
 
-        // ── egui overlay pass ────────────────────────────────────────────────
-        // LoadOp::Load preserves the 3-D scene below the UI.
-        // forget_lifetime() is required by egui_wgpu's render() API.
+        // ── Pass 2: Depth resolve (MSAA → single-sample) ──────────────────────
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("DepthResolvePass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_single_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.depth_resolve_pipeline);
+            pass.set_bind_group(0, &self.depth_resolve_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // ── Pass 3: OIT transparent pass (surface mesh) ───────────────────────
+        // Reads depth_single for depth test (no write), writes to oit_accum + oit_reveal
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("OITPass"),
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.oit_accum_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: &self.oit_reveal_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    }),
+                ],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_single_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            if let (Some(vb), Some(ib)) = (&self.surface_vb, &self.surface_ib) {
+                pass.set_pipeline(&self.surface_oit_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.surface_index_count, 0, 0..1);
+            }
+        }
+
+        // ── Pass 4: SSAO pass ─────────────────────────────────────────────────
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("SSAOPass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.ssao_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.ssao_pipeline);
+            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            pass.set_bind_group(1, &self.ssao_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // ── Pass 5: Post composite pass ───────────────────────────────────────
+        // OIT blend + SSAO + Sobel edge + ACES → output_view (sRGB)
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("PostPass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &output_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&self.post_pipeline);
+            pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            pass.set_bind_group(1, &self.post_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // ── Pass 6: egui overlay ──────────────────────────────────────────────
         {
             let mut pass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("EguiPass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &output_view,  // render onto the resolved surface
+                        view: &output_view,
                         resolve_target: None,
                         ops: wgpu::Operations {
                             load: wgpu::LoadOp::Load,
@@ -846,6 +1326,71 @@ impl RenderState {
         Ok(())
     }
 }
+
+// ── Bind group helpers ────────────────────────────────────────────────────────
+
+fn create_depth_resolve_bg(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    msaa_depth_view: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("DepthResolveBG"),
+        layout: bgl,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(msaa_depth_view),
+        }],
+    })
+}
+
+fn create_ssao_bg(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    depth_single_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("SSAOBG"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(depth_single_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
+fn create_post_bg(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    scene_view: &wgpu::TextureView,
+    accum_view: &wgpu::TextureView,
+    reveal_view: &wgpu::TextureView,
+    ssao_view: &wgpu::TextureView,
+    depth_single_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("PostBG"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(scene_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(accum_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(reveal_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(ssao_view) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(depth_single_view) },
+            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    })
+}
+
+// ── Pipeline builder ──────────────────────────────────────────────────────────
 
 fn build_pipeline(
     device: &wgpu::Device,
@@ -894,6 +1439,8 @@ fn build_pipeline(
     })
 }
 
+// ── Texture creation helpers ──────────────────────────────────────────────────
+
 fn create_depth_texture(
     device: &wgpu::Device,
     config: &wgpu::SurfaceConfiguration,
@@ -910,7 +1457,30 @@ fn create_depth_texture(
         sample_count,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        // TEXTURE_BINDING so depth_resolve shader can read it
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
+}
+
+fn create_depth_single_texture(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("DepthSingle"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());
@@ -931,7 +1501,7 @@ fn create_msaa_color_texture(
         mip_level_count: 1,
         sample_count: 4,
         dimension: wgpu::TextureDimension::D2,
-        format: config.format,
+        format: wgpu::TextureFormat::Rgba16Float,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         view_formats: &[],
     });
@@ -939,10 +1509,76 @@ fn create_msaa_color_texture(
     (texture, view)
 }
 
+fn create_rgba16float_texture(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+    sample_count: u32,
+    usage: wgpu::TextureUsages,
+    label: &str,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba16Float,
+        usage,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
+}
+
+fn create_r16float_texture(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("OITReveal"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R16Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
+}
+
+fn create_r8unorm_texture(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("SSAO"),
+        size: wgpu::Extent3d {
+            width: config.width,
+            height: config.height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R8Unorm,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&Default::default());
+    (texture, view)
+}
+
 /// Compute per-atom residue identifiers for a structure.
-/// The identifier is the index of the first atom in the same residue
-/// (grouped by chain + seq_num + ins_code). All atoms in one residue
-/// share the same value, enabling exact equality tests in shaders.
 fn compute_residue_ids(structure: &crate::structure::atom::Structure) -> Vec<u32> {
     let atoms = &structure.atoms;
     let mut ids = vec![0u32; atoms.len()];

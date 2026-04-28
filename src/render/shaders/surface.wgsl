@@ -1,15 +1,19 @@
-// Surface shader: identical lighting to ribbon.wgsl but normals are NOT flipped
-// by front-facing test, because the gradient-based normals are always outward.
+// Surface shader: Weighted Blended OIT output.
+// Outputs accum (Rgba16Float) at @location(0) and reveal (R16Float) at @location(1).
+// ACES tone mapping is done in post.wgsl; this shader outputs linear HDR.
+
 struct Uniforms {
-    view_proj:         mat4x4<f32>,
-    light_dir:         vec3<f32>,
-    picked_residue_id: u32,       // offset 76 (fills former padding after light_dir)
-    // camera_pos.xyz = eye position, camera_pos.w = light_intensity
-    camera_pos:        vec4<f32>,
+    view_proj:         mat4x4<f32>,  // offset 0
+    light_dir:         vec3<f32>,    // offset 64
+    picked_residue_id: u32,          // offset 76
+    camera_pos:        vec3<f32>,    // offset 80
+    light_intensity:   f32,          // offset 92
+    inv_proj:          mat4x4<f32>,  // offset 96
+    screen_size:       vec2<f32>,    // offset 160
+    _pad:              vec2<f32>,    // offset 168
 }
 
-@group(0) @binding(0)
-var<uniform> u: Uniforms;
+@group(0) @binding(0) var<uniform> u: Uniforms;
 
 struct VertIn {
     @location(0) position:   vec3<f32>,
@@ -19,48 +23,56 @@ struct VertIn {
 }
 
 struct VertOut {
-    @builtin(position)              clip_pos:     vec4<f32>,
-    @location(0)                    world_pos:    vec3<f32>,
-    @location(1)                    world_normal: vec3<f32>,
-    @location(2)                    color:        vec3<f32>,
-    @location(3) @interpolate(flat) residue_id:   u32,
+    @builtin(position)              clip_pos:   vec4<f32>,
+    @location(0)                    world_pos:  vec3<f32>,
+    @location(1)                    world_nrm:  vec3<f32>,
+    @location(2)                    color:      vec3<f32>,
+    @location(3) @interpolate(flat) residue_id: u32,
+}
+
+struct OITOut {
+    @location(0) accum:  vec4<f32>,  // RGB*alpha*w, alpha*w
+    @location(1) reveal: vec4<f32>,  // .a = alpha (used by blend equation)
 }
 
 @vertex
 fn vs_main(in: VertIn) -> VertOut {
     var out: VertOut;
-    out.clip_pos     = u.view_proj * vec4<f32>(in.position, 1.0);
-    out.world_pos    = in.position;
-    out.world_normal = in.normal;
-    out.color        = in.color;
-    out.residue_id   = in.residue_id;
+    out.clip_pos   = u.view_proj * vec4<f32>(in.position, 1.0);
+    out.world_pos  = in.position;
+    out.world_nrm  = in.normal;
+    out.color      = in.color;
+    out.residue_id = in.residue_id;
     return out;
 }
 
-fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
-    return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), vec3(0.0), vec3(1.0));
-}
-
 @fragment
-fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
-    // Gradient-based normals are always outward; no front-facing flip needed.
-    let N = normalize(in.world_normal);
+fn fs_main(in: VertOut) -> OITOut {
+    let N = normalize(in.world_nrm);
     let L = normalize(u.light_dir);
     let V = normalize(u.camera_pos.xyz - in.world_pos);
     let H = normalize(L + V);
 
-    // High contrast: deep shadows, bright lit face.
     let half_diff = dot(N, L) * 0.90 + 0.10;
     let ambient  = 0.10;
     let diffuse  = half_diff * 1.25;
     let specular = pow(max(dot(N, H), 0.0), 80.0) * 0.85;
-
-    let lit = (ambient + diffuse + specular) * u.camera_pos.w;
-    var color_out = in.color * lit;
+    let lit = (ambient + diffuse + specular) * u.light_intensity;
+    var color = in.color * lit;
 
     if u.picked_residue_id != 0u && in.residue_id == u.picked_residue_id {
         let rim = pow(1.0 - max(dot(V, N), 0.0), 3.0);
-        color_out += rim * vec3<f32>(1.0, 0.6, 0.0) * 1.5;
+        color += rim * vec3<f32>(1.0, 0.6, 0.0) * 1.5;
     }
-    return vec4<f32>(aces_tonemap(color_out), 1.0);
+
+    let alpha = 0.65;
+
+    // WB-OIT weight: depth-dependent
+    let depth = in.clip_pos.z / in.clip_pos.w;
+    let w = alpha * clamp(0.03 / (1e-5 + pow(depth * 0.2, 3.0)), 1e-2, 3e3);
+
+    var out: OITOut;
+    out.accum  = vec4<f32>(color * alpha * w, alpha * w);
+    out.reveal = vec4<f32>(0.0, 0.0, 0.0, alpha);  // .a used as src_alpha for blend
+    return out;
 }

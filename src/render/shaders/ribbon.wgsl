@@ -35,10 +35,6 @@ fn vs_main(in: VertIn) -> VertOut {
     return out;
 }
 
-fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
-    return clamp(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), vec3(0.0), vec3(1.0));
-}
-
 @fragment
 fn fs_main(in: VertOut, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
     // Flip normal for back-facing fragments so both sides are lit correctly.
@@ -59,5 +55,5 @@ fn fs_main(in: VertOut, @builtin(front_facing) is_front: bool) -> @location(0) v
         let rim = pow(1.0 - max(dot(V, N), 0.0), 3.0);
         color_out += rim * vec3<f32>(1.0, 0.6, 0.0) * 1.5;
     }
-    return vec4<f32>(aces_tonemap(color_out), 1.0);
+    return vec4<f32>(color_out, 1.0);
 }
