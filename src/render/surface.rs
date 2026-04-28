@@ -579,13 +579,113 @@ pub fn build_surface(
 
     // Merge per-slice results, offsetting indices by the running vertex count.
     let vert_start = vertices.len();
+    let idx_start  = indices.len();
     for (local_verts, local_idxs) in slices {
         let base = vertices.len() as u32;
         vertices.extend_from_slice(&local_verts);
         indices.extend(local_idxs.into_iter().map(|idx| idx + base));
     }
 
-    // ── 6. Post-process: assign residue_id to each surface vertex ─────────────
+    // ── 6. Keep only the largest connected component ───────────────────────────
+    // Marching Cubes can generate isolated polygon shells inside the protein
+    // (from internal density pockets).  Discard everything except the largest
+    // component so the exterior surface is unambiguous.
+    {
+        let n_verts = vertices.len() - vert_start;
+        if n_verts > 0 {
+            // Build adjacency: vertex → neighbours (relative indices)
+            let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n_verts];
+            for tri in indices[idx_start..].chunks(3) {
+                let (a, b, c) = (
+                    (tri[0] - vert_start as u32) as usize,
+                    (tri[1] - vert_start as u32) as usize,
+                    (tri[2] - vert_start as u32) as usize,
+                );
+                adj[a].push(b as u32);
+                adj[a].push(c as u32);
+                adj[b].push(a as u32);
+                adj[b].push(c as u32);
+                adj[c].push(a as u32);
+                adj[c].push(b as u32);
+            }
+
+            // BFS: assign component id to every vertex
+            let mut comp: Vec<u32> = vec![u32::MAX; n_verts];
+            let mut comp_sizes: Vec<usize> = Vec::new();
+            let mut comp_id = 0u32;
+            for start in 0..n_verts {
+                if comp[start] != u32::MAX { continue; }
+                let mut queue = std::collections::VecDeque::new();
+                queue.push_back(start);
+                comp[start] = comp_id;
+                let mut size = 0usize;
+                while let Some(v) = queue.pop_front() {
+                    size += 1;
+                    for &nb in &adj[v] {
+                        let nb = nb as usize;
+                        if comp[nb] == u32::MAX {
+                            comp[nb] = comp_id;
+                            queue.push_back(nb);
+                        }
+                    }
+                }
+                comp_sizes.push(size);
+                comp_id += 1;
+            }
+
+            // Identify the largest component
+            let largest = comp_sizes
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, &s)| s)
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+
+            let removed = comp_sizes.iter().enumerate()
+                .filter(|&(i, _)| i as u32 != largest)
+                .map(|(_, &s)| s)
+                .sum::<usize>();
+            if removed > 0 {
+                log::info!("surface: removed {} vertices in {} small components",
+                    removed, comp_sizes.len() - 1);
+            }
+
+            // Filter indices: keep only triangles whose vertices all belong to `largest`
+            let new_idxs: Vec<u32> = indices[idx_start..]
+                .chunks(3)
+                .filter(|tri| comp[(tri[0] - vert_start as u32) as usize] == largest)
+                .flat_map(|tri| tri.iter().copied())
+                .collect();
+
+            // Rebuild vertex array: mark used, remap
+            let mut used = vec![false; n_verts];
+            for &i in &new_idxs {
+                used[(i - vert_start as u32) as usize] = true;
+            }
+            let mut remap = vec![0u32; n_verts];
+            let mut new_verts: Vec<RibbonVertex> = Vec::new();
+            let mut next = 0u32;
+            for (i, &u) in used.iter().enumerate() {
+                if u {
+                    remap[i] = next;
+                    new_verts.push(vertices[vert_start + i]);
+                    next += 1;
+                }
+            }
+            let remapped: Vec<u32> = new_idxs
+                .iter()
+                .map(|&i| remap[(i - vert_start as u32) as usize] + vert_start as u32)
+                .collect();
+
+            // Write filtered results back
+            vertices.truncate(vert_start);
+            vertices.extend_from_slice(&new_verts);
+            indices.truncate(idx_start);
+            indices.extend_from_slice(&remapped);
+        }
+    }
+
+    // ── 7. Post-process: assign residue_id to each surface vertex ─────────────
     // Build a spatial hash of atom positions (cell size ~3 Å) then query
     // the nearest atom for each vertex. O(A) build + O(V × ~27) query.
     const CELL: f32 = 3.0;
