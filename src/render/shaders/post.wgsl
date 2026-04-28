@@ -1,8 +1,7 @@
 // Post-process composite pass:
-//   1. Blend WB-OIT transparent surface onto opaque scene
-//   2. Apply SSAO
-//   3. Apply depth Sobel edge outline
-//   4. Apply ACES tone mapping
+//   1. Apply SSAO
+//   2. Apply depth Sobel edge outline
+//   3. Apply ACES tone mapping
 
 struct Uniforms {
     view_proj:         mat4x4<f32>,
@@ -17,12 +16,10 @@ struct Uniforms {
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
 
-@group(1) @binding(0) var scene_tex:  texture_2d<f32>;   // opaque scene (Rgba16Float)
-@group(1) @binding(1) var accum_tex:  texture_2d<f32>;   // OIT accum (Rgba16Float)
-@group(1) @binding(2) var reveal_tex: texture_2d<f32>;   // OIT reveal (R16Float)
-@group(1) @binding(3) var ssao_tex:   texture_2d<f32>;   // SSAO (R8Unorm)
-@group(1) @binding(4) var depth_tex:  texture_depth_2d;  // resolved depth
-@group(1) @binding(5) var lin_samp:   sampler;
+@group(1) @binding(0) var scene_tex: texture_2d<f32>;   // opaque+surface scene (Rgba16Float)
+@group(1) @binding(1) var ssao_tex:  texture_2d<f32>;   // SSAO (R8Unorm)
+@group(1) @binding(2) var depth_tex: texture_depth_2d;  // resolved depth
+@group(1) @binding(3) var lin_samp:  sampler;
 
 struct VertOut {
     @builtin(position) pos: vec4<f32>,
@@ -45,21 +42,11 @@ fn aces_tonemap(x: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
-    let scene  = textureSample(scene_tex,  lin_samp, in.uv).rgb;
-    let accum  = textureSample(accum_tex,  lin_samp, in.uv);
-    let reveal = textureSample(reveal_tex, lin_samp, in.uv).r;
-    let ao     = textureSample(ssao_tex,   lin_samp, in.uv).r;
-
-    // WB-OIT composite
-    var color = scene;
-    if accum.a > 1e-4 {
-        let avg = accum.rgb / max(accum.a, 1e-5);
-        color = avg * (1.0 - reveal) + color * reveal;
-    }
+    var color = textureSample(scene_tex, lin_samp, in.uv).rgb;
+    let ao    = textureSample(ssao_tex,  lin_samp, in.uv).r;
 
     // SSAO: darken ambient term
-    let ao_strength = 0.7;
-    color *= mix(1.0, ao, ao_strength);
+    color *= mix(1.0, ao, 0.7);
 
     // Depth-based edge outline (Sobel)
     let px = 1.0 / u.screen_size;

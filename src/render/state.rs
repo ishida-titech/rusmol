@@ -60,8 +60,8 @@ pub struct RenderState {
     ribbon_ib: Option<wgpu::Buffer>,
     ribbon_index_count: u32,
 
-    // ── Surface OIT pipeline ──────────────────────────────────────────────────
-    surface_oit_pipeline: wgpu::RenderPipeline,
+    // ── Surface pipeline (alpha-blend into MSAA target) ──────────────────────
+    surface_pipeline: wgpu::RenderPipeline,
     surface_vb: Option<wgpu::Buffer>,
     surface_ib: Option<wgpu::Buffer>,
     surface_index_count: u32,
@@ -81,12 +81,6 @@ pub struct RenderState {
     // ── Single-sample depth for post-process sampling ─────────────────────────
     depth_single_tex: wgpu::Texture,
     depth_single_view: wgpu::TextureView,
-
-    // ── OIT textures ──────────────────────────────────────────────────────────
-    oit_accum_tex: wgpu::Texture,
-    oit_accum_view: wgpu::TextureView,
-    oit_reveal_tex: wgpu::Texture,
-    oit_reveal_view: wgpu::TextureView,
 
     // ── SSAO texture ──────────────────────────────────────────────────────────
     ssao_tex: wgpu::Texture,
@@ -202,15 +196,8 @@ impl RenderState {
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             "SceneColor",
         );
-        // Single-sample depth for SSAO / OIT / post
+        // Single-sample depth for SSAO / post
         let (depth_single_tex, depth_single_view) = create_depth_single_texture(&device, &config);
-        // OIT textures
-        let (oit_accum_tex, oit_accum_view) = create_rgba16float_texture(
-            &device, &config, 1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            "OITAccum",
-        );
-        let (oit_reveal_tex, oit_reveal_view) = create_r16float_texture(&device, &config);
         // SSAO texture
         let (ssao_tex, ssao_view) = create_r8unorm_texture(&device, &config);
 
@@ -370,13 +357,16 @@ impl RenderState {
             cache: None,
         });
 
-        // ── Surface OIT pipeline (non-MSAA, dual render targets) ─────────────
+        // ── Surface pipeline (alpha-blend into MSAA HDR target) ──────────────
+        // Renders after opaque geometry in the same MSAA pass. depth_write_enabled
+        // ensures only the nearest surface fragment per pixel is blended, giving
+        // a uniform single-layer alpha across the entire mesh.
         let surface_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SurfaceShader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/surface.wgsl").into()),
         });
-        let surface_oit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("SurfaceOITPipeline"),
+        let surface_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("SurfacePipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &surface_shader,
@@ -388,56 +378,25 @@ impl RenderState {
                 module: &surface_shader,
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
-                targets: &[
-                    // target[0]: OIT accum (Rgba16Float), additive blend
-                    Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::One,
-                                dst_factor: wgpu::BlendFactor::One,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                    // target[1]: OIT reveal (R16Float), multiply blend: dst * (1 - src.a)
-                    Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::R16Float,
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::Zero,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                            alpha: wgpu::BlendComponent {
-                                src_factor: wgpu::BlendFactor::Zero,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                                operation: wgpu::BlendOperation::Add,
-                            },
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    }),
-                ],
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back), // cull back faces: prevents double-layer opacity
+                cull_mode: Some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: false,
+                depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
             multiview: None,
             cache: None,
         });
@@ -564,7 +523,7 @@ impl RenderState {
         let post_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("PostBGL"),
             entries: &[
-                // scene_tex
+                // scene_tex (binding 0)
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -575,7 +534,7 @@ impl RenderState {
                     },
                     count: None,
                 },
-                // accum_tex
+                // ssao_tex (binding 1)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -586,31 +545,9 @@ impl RenderState {
                     },
                     count: None,
                 },
-                // reveal_tex
+                // depth_tex (binding 2)
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // ssao_tex
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // depth_tex
-                wgpu::BindGroupLayoutEntry {
-                    binding: 4,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Depth,
@@ -619,9 +556,9 @@ impl RenderState {
                     },
                     count: None,
                 },
-                // lin_samp
+                // lin_samp (binding 3)
                 wgpu::BindGroupLayoutEntry {
-                    binding: 5,
+                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -668,8 +605,7 @@ impl RenderState {
 
         let post_bg = create_post_bg(
             &device, &post_bgl,
-            &scene_color_view, &oit_accum_view, &oit_reveal_view,
-            &ssao_view, &depth_single_view, &linear_sampler,
+            &scene_color_view, &ssao_view, &depth_single_view, &linear_sampler,
         );
 
         // ── Phase 5: picker ──────────────────────────────────────────────────
@@ -702,7 +638,7 @@ impl RenderState {
             ribbon_vb: None,
             ribbon_ib: None,
             ribbon_index_count: 0,
-            surface_oit_pipeline,
+            surface_pipeline,
             surface_vb: None,
             surface_ib: None,
             surface_index_count: 0,
@@ -714,10 +650,6 @@ impl RenderState {
             scene_color_view,
             depth_single_tex,
             depth_single_view,
-            oit_accum_tex,
-            oit_accum_view,
-            oit_reveal_tex,
-            oit_reveal_view,
             ssao_tex,
             ssao_view,
             depth_resolve_pipeline,
@@ -774,18 +706,6 @@ impl RenderState {
         self.depth_single_tex = dst;
         self.depth_single_view = dsv;
 
-        let (oat, oav) = create_rgba16float_texture(
-            &self.device, &self.config, 1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            "OITAccum",
-        );
-        self.oit_accum_tex = oat;
-        self.oit_accum_view = oav;
-
-        let (ort, orv) = create_r16float_texture(&self.device, &self.config);
-        self.oit_reveal_tex = ort;
-        self.oit_reveal_view = orv;
-
         let (st, sv) = create_r8unorm_texture(&self.device, &self.config);
         self.ssao_tex = st;
         self.ssao_view = sv;
@@ -795,8 +715,7 @@ impl RenderState {
         self.ssao_bg = create_ssao_bg(&self.device, &self.ssao_bgl, &self.depth_single_view, &self.linear_sampler);
         self.post_bg = create_post_bg(
             &self.device, &self.post_bgl,
-            &self.scene_color_view, &self.oit_accum_view, &self.oit_reveal_view,
-            &self.ssao_view, &self.depth_single_view, &self.linear_sampler,
+            &self.scene_color_view, &self.ssao_view, &self.depth_single_view, &self.linear_sampler,
         );
 
         self.picker.resize(&self.device, width, height);
@@ -1192,6 +1111,15 @@ impl RenderState {
                 pass.set_index_buffer(self.sphere_ib.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.sphere_index_count, 0, 0..self.sphere_instance_count);
             }
+
+            // Draw surface (alpha-blend, depth test+write — only nearest layer per pixel)
+            if let (Some(vb), Some(ib)) = (&self.surface_vb, &self.surface_ib) {
+                pass.set_pipeline(&self.surface_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.surface_index_count, 0, 0..1);
+            }
         }
 
         // ── Pass 2: Depth resolve (MSAA → single-sample) ──────────────────────
@@ -1214,50 +1142,7 @@ impl RenderState {
             pass.draw(0..3, 0..1);
         }
 
-        // ── Pass 3: OIT transparent pass (surface mesh) ───────────────────────
-        // Reads depth_single for depth test (no write), writes to oit_accum + oit_reveal
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("OITPass"),
-                color_attachments: &[
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: &self.oit_accum_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    }),
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: &self.oit_reveal_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    }),
-                ],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_single_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                ..Default::default()
-            });
-
-            if let (Some(vb), Some(ib)) = (&self.surface_vb, &self.surface_ib) {
-                pass.set_pipeline(&self.surface_oit_pipeline);
-                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.surface_index_count, 0, 0..1);
-            }
-        }
-
-        // ── Pass 4: SSAO pass ─────────────────────────────────────────────────
+        // ── Pass 3: SSAO pass ─────────────────────────────────────────────────
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("SSAOPass"),
@@ -1278,8 +1163,8 @@ impl RenderState {
             pass.draw(0..3, 0..1);
         }
 
-        // ── Pass 5: Post composite pass ───────────────────────────────────────
-        // OIT blend + SSAO + Sobel edge + ACES → output_view (sRGB)
+        // ── Pass 4: Post composite pass ───────────────────────────────────────
+        // SSAO + Sobel edge + ACES → output_view (sRGB)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("PostPass"),
@@ -1300,7 +1185,7 @@ impl RenderState {
             pass.draw(0..3, 0..1);
         }
 
-        // ── Pass 6: egui overlay ──────────────────────────────────────────────
+        // ── Pass 5: egui overlay ──────────────────────────────────────────────
         {
             let mut pass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1375,8 +1260,6 @@ fn create_post_bg(
     device: &wgpu::Device,
     bgl: &wgpu::BindGroupLayout,
     scene_view: &wgpu::TextureView,
-    accum_view: &wgpu::TextureView,
-    reveal_view: &wgpu::TextureView,
     ssao_view: &wgpu::TextureView,
     depth_single_view: &wgpu::TextureView,
     sampler: &wgpu::Sampler,
@@ -1386,11 +1269,9 @@ fn create_post_bg(
         layout: bgl,
         entries: &[
             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(scene_view) },
-            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(accum_view) },
-            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(reveal_view) },
-            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(ssao_view) },
-            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(depth_single_view) },
-            wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::Sampler(sampler) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(ssao_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_single_view) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
         ],
     })
 }
@@ -1533,28 +1414,6 @@ fn create_rgba16float_texture(
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Rgba16Float,
         usage,
-        view_formats: &[],
-    });
-    let view = texture.create_view(&Default::default());
-    (texture, view)
-}
-
-fn create_r16float_texture(
-    device: &wgpu::Device,
-    config: &wgpu::SurfaceConfiguration,
-) -> (wgpu::Texture, wgpu::TextureView) {
-    let texture = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("OITReveal"),
-        size: wgpu::Extent3d {
-            width: config.width,
-            height: config.height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R16Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });
     let view = texture.create_view(&Default::default());
