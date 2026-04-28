@@ -136,6 +136,8 @@ pub struct RenderState {
     pub light_elevation_deg: f32,
     /// Light azimuth angle in degrees clockwise from forward (default 20.0).
     pub light_azimuth_deg: f32,
+    /// Surface transparency alpha (default 0.65). Set via `set transparency`.
+    pub surface_alpha: f32,
 
     /// egui overlay renderer.
     pub egui_renderer: egui_wgpu::Renderer,
@@ -234,6 +236,7 @@ impl RenderState {
             0,
             1.0,
             screen_size,
+            0.65,
         );
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniforms"),
@@ -738,6 +741,7 @@ impl RenderState {
             light_intensity: 1.0,
             light_elevation_deg: 30.0,
             light_azimuth_deg: 20.0,
+            surface_alpha: 0.65,
             egui_renderer,
         })
     }
@@ -1035,6 +1039,7 @@ impl RenderState {
             self.picked_residue_id,
             self.light_intensity,
             screen_size,
+            self.surface_alpha,
         );
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

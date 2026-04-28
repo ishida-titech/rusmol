@@ -274,6 +274,7 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
 
         Command::Background(_) => (CommandResponse::Ok(String::new()), false),
         Command::Light { .. }  => (CommandResponse::Ok(String::new()), false),
+        Command::Set { .. }    => (CommandResponse::Ok(String::new()), false),
         Command::Quit => (CommandResponse::Ok("bye".into()), false),
     }
 }

@@ -308,6 +308,22 @@ impl ApplicationHandler for App {
                     continue;
                 }
 
+                if let Command::Set { ref name, value } = cmd {
+                    if let AppState::Running { render, window, .. } = &mut self.state {
+                        match name.as_str() {
+                            "transparency" | "surface_transparency" => {
+                                render.surface_alpha = (1.0 - value).clamp(0.0, 1.0);
+                                window.request_redraw();
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(tx) = &self.resp_tx {
+                        let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
+                    }
+                    continue;
+                }
+
                 let AppState::Running { camera, .. } = &mut self.state else { break };
                 let (response, dirty) = executor::execute(cmd, &mut self.scene, camera);
 
@@ -408,6 +424,17 @@ impl App {
                         if let Some(v) = elevation { render.light_elevation_deg = v; }
                         if let Some(v) = azimuth   { render.light_azimuth_deg   = v; }
                         window.request_redraw();
+                    }
+                    return;
+                }
+                if let Command::Set { ref name, value } = cmd {
+                    if let AppState::Running { render, .. } = &mut self.state {
+                        match name.as_str() {
+                            "transparency" | "surface_transparency" => {
+                                render.surface_alpha = (1.0 - value).clamp(0.0, 1.0);
+                            }
+                            _ => {}
+                        }
                     }
                     return;
                 }

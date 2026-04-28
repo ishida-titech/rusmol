@@ -37,6 +37,7 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
             }
         }
         "light" => parse_light(rest),
+        "set"   => parse_set(rest),
         "quit" | "q" | "exit" => Ok(Command::Quit),
         other => Err(format!("unknown command: '{other}'")),
     }
@@ -132,6 +133,28 @@ fn parse_color_spec(s: &str) -> Result<ColorSpec, String> {
         return Ok(ColorSpec::Rgb(rgb));
     }
     Err(format!("unknown color: '{s}'"))
+}
+
+/// Parse: `set name, value`
+/// Supported: transparency / surface_transparency (value 0=opaque .. 1=invisible)
+fn parse_set(rest: &str) -> Result<Command, String> {
+    if rest.is_empty() {
+        return Err("set: expected name, value".into());
+    }
+    let parts = split_comma(rest, 2);
+    if parts.len() < 2 {
+        return Err("set: expected 'set name, value'".into());
+    }
+    let name = parts[0].trim().to_lowercase();
+    let val_str = parts[1].trim();
+    let value: f32 = val_str
+        .parse()
+        .map_err(|_| format!("set: '{val_str}' is not a number"))?;
+    match name.as_str() {
+        "transparency" | "surface_transparency" => {}
+        other => return Err(format!("set: unknown setting '{other}'")),
+    }
+    Ok(Command::Set { name, value })
 }
 
 /// Parse: `light [intensity <f>] [elevation <f>] [azimuth <f>]`

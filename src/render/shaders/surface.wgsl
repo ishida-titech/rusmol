@@ -10,7 +10,8 @@ struct Uniforms {
     light_intensity:   f32,          // offset 92
     inv_proj:          mat4x4<f32>,  // offset 96
     screen_size:       vec2<f32>,    // offset 160
-    _pad:              vec2<f32>,    // offset 168
+    surface_alpha:     f32,          // offset 168
+    _pad:              f32,          // offset 172
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -65,7 +66,7 @@ fn fs_main(in: VertOut) -> OITOut {
         color += rim * vec3<f32>(1.0, 0.6, 0.0) * 1.5;
     }
 
-    let alpha = 0.65;
+    let alpha = clamp(u.surface_alpha, 0.0, 1.0);
 
     // WB-OIT weight: depth-dependent
     let depth = in.clip_pos.z / in.clip_pos.w;

@@ -11,7 +11,8 @@ pub struct Uniforms {
     pub light_intensity:   f32,           // offset  92,  4 bytes
     pub inv_proj:          [[f32; 4]; 4], // offset  96, 64 bytes (for SSAO)
     pub screen_size:       [f32; 2],      // offset 160,  8 bytes
-    pub _pad:              [f32; 2],      // offset 168,  8 bytes → total 176 bytes
+    pub surface_alpha:     f32,           // offset 168,  4 bytes
+    pub _pad:              f32,           // offset 172,  4 bytes → total 176 bytes
 }
 
 impl Uniforms {
@@ -23,6 +24,7 @@ impl Uniforms {
         picked_residue_id: u32,
         light_intensity: f32,
         screen_size: [f32; 2],
+        surface_alpha: f32,
     ) -> Self {
         Self {
             view_proj: view_proj.to_cols_array_2d(),
@@ -32,7 +34,8 @@ impl Uniforms {
             light_intensity,
             inv_proj: inv_proj.to_cols_array_2d(),
             screen_size,
-            _pad: [0.0; 2],
+            surface_alpha,
+            _pad: 0.0,
         }
     }
 }
