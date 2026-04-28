@@ -260,14 +260,20 @@ fn build_segment(
         if side.length_squared() < 0.5 { side = orthogonal_to(stan[0]); }
 
         for i in 0..m {
-            // At each Cα boundary (except the very first point which is already set),
-            // snap the side vector to the smoothed O direction.
+            // At each Cα boundary, optionally correct toward O direction.
+            // SKIP correction for interior sheet residues — the flat cross-section
+            // makes even a tiny frame rotation visible as a width change.
+            // Only the first CA of a sheet run gets corrected (to orient the strand).
             if i > 0 && i % N_SUB == 0 {
                 let seg = (i / N_SUB).min(n - 1);
-                let o_ideal = project_perp(o_dir[seg], stan[i]).normalize_or_zero();
-                if o_ideal.length_squared() > 0.5 {
-                    // Flip to maintain sign consistency with the propagated frame.
-                    side = if o_ideal.dot(side) >= 0.0 { o_ideal } else { -o_ideal };
+                let is_interior_sheet = ss_types[seg] == SecondaryStructure::Sheet
+                    && seg > 0
+                    && ss_types[seg - 1] == SecondaryStructure::Sheet;
+                if !is_interior_sheet {
+                    let o_ideal = project_perp(o_dir[seg], stan[i]).normalize_or_zero();
+                    if o_ideal.length_squared() > 0.5 {
+                        side = if o_ideal.dot(side) >= 0.0 { o_ideal } else { -o_ideal };
+                    }
                 }
             }
 
