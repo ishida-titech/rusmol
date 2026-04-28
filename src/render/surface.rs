@@ -587,33 +587,58 @@ pub fn build_surface(
     }
 
     // ── 6. Keep only the largest connected component ───────────────────────────
-    // Marching Cubes can generate isolated polygon shells inside the protein
-    // (from internal density pockets).  Discard everything except the largest
-    // component so the exterior surface is unambiguous.
+    // Marching Cubes generates per-slice vertex buffers with NO shared vertices
+    // across slice boundaries.  Two adjacent cubes sharing a geometric edge
+    // produce SEPARATE vertices at the same position, so the raw mesh is
+    // topologically disconnected even though it looks continuous.
+    //
+    // Fix: first WELD duplicate vertices (same position → same index), then run
+    // BFS on the welded mesh to find the true connected components.
     {
-        let n_verts = vertices.len() - vert_start;
-        if n_verts > 0 {
-            // Build adjacency: vertex → neighbours (relative indices)
-            let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n_verts];
-            for tri in indices[idx_start..].chunks(3) {
-                let (a, b, c) = (
-                    (tri[0] - vert_start as u32) as usize,
-                    (tri[1] - vert_start as u32) as usize,
-                    (tri[2] - vert_start as u32) as usize,
-                );
-                adj[a].push(b as u32);
-                adj[a].push(c as u32);
-                adj[b].push(a as u32);
-                adj[b].push(c as u32);
-                adj[c].push(a as u32);
-                adj[c].push(b as u32);
+        let n_raw = vertices.len() - vert_start;
+        if n_raw > 0 {
+            // ── Step 1: Weld vertices ─────────────────────────────────────────
+            // Quantise each position to a fixed grid (0.5 mm ≈ sub-Ångström)
+            // and merge vertices that map to the same grid cell.
+            const WELD_SCALE: f32 = 2048.0;
+            let mut pos_map: HashMap<[i32; 3], u32> = HashMap::new();
+            let mut welded_verts: Vec<RibbonVertex> = Vec::new();
+            let mut raw_to_welded = vec![0u32; n_raw];
+            for i in 0..n_raw {
+                let v = &vertices[vert_start + i];
+                let key = [
+                    (v.position[0] * WELD_SCALE).round() as i32,
+                    (v.position[1] * WELD_SCALE).round() as i32,
+                    (v.position[2] * WELD_SCALE).round() as i32,
+                ];
+                let wi = *pos_map.entry(key).or_insert_with(|| {
+                    let j = welded_verts.len() as u32;
+                    welded_verts.push(*v);
+                    j
+                });
+                raw_to_welded[i] = wi;
             }
 
-            // BFS: assign component id to every vertex
-            let mut comp: Vec<u32> = vec![u32::MAX; n_verts];
+            // Remap index buffer to welded vertex indices.
+            let welded_idxs: Vec<u32> = indices[idx_start..]
+                .iter()
+                .map(|&i| raw_to_welded[(i - vert_start as u32) as usize])
+                .collect();
+            let n_welded = welded_verts.len();
+
+            // ── Step 2: BFS on welded mesh ────────────────────────────────────
+            let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n_welded];
+            for tri in welded_idxs.chunks(3) {
+                let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+                adj[a].push(b as u32); adj[a].push(c as u32);
+                adj[b].push(a as u32); adj[b].push(c as u32);
+                adj[c].push(a as u32); adj[c].push(b as u32);
+            }
+
+            let mut comp = vec![u32::MAX; n_welded];
             let mut comp_sizes: Vec<usize> = Vec::new();
             let mut comp_id = 0u32;
-            for start in 0..n_verts {
+            for start in 0..n_welded {
                 if comp[start] != u32::MAX { continue; }
                 let mut queue = std::collections::VecDeque::new();
                 queue.push_back(start);
@@ -633,7 +658,7 @@ pub fn build_surface(
                 comp_id += 1;
             }
 
-            // Identify the largest component
+            // ── Step 3: Keep largest component ───────────────────────────────
             let largest = comp_sizes
                 .iter()
                 .enumerate()
@@ -641,47 +666,49 @@ pub fn build_surface(
                 .map(|(i, _)| i as u32)
                 .unwrap_or(0);
 
-            let removed = comp_sizes.iter().enumerate()
+            let removed: usize = comp_sizes.iter().enumerate()
                 .filter(|&(i, _)| i as u32 != largest)
                 .map(|(_, &s)| s)
-                .sum::<usize>();
+                .sum();
             if removed > 0 {
-                log::info!("surface: removed {} vertices in {} small components",
-                    removed, comp_sizes.len() - 1);
+                log::info!(
+                    "surface: removed {} welded-vertices in {} small components",
+                    removed,
+                    comp_sizes.len() - 1
+                );
             }
 
-            // Filter indices: keep only triangles whose vertices all belong to `largest`
-            let new_idxs: Vec<u32> = indices[idx_start..]
+            // Filter index buffer: keep triangles whose welded vertices are all in `largest`.
+            let kept_idxs: Vec<u32> = welded_idxs
                 .chunks(3)
-                .filter(|tri| comp[(tri[0] - vert_start as u32) as usize] == largest)
+                .filter(|tri| comp[tri[0] as usize] == largest)
                 .flat_map(|tri| tri.iter().copied())
                 .collect();
 
-            // Rebuild vertex array: mark used, remap
-            let mut used = vec![false; n_verts];
-            for &i in &new_idxs {
-                used[(i - vert_start as u32) as usize] = true;
-            }
-            let mut remap = vec![0u32; n_verts];
-            let mut new_verts: Vec<RibbonVertex> = Vec::new();
+            // ── Step 4: Compact welded vertex array ───────────────────────────
+            let mut used = vec![false; n_welded];
+            for &i in &kept_idxs { used[i as usize] = true; }
+
+            let mut welded_remap = vec![0u32; n_welded];
+            let mut final_verts: Vec<RibbonVertex> = Vec::new();
             let mut next = 0u32;
             for (i, &u) in used.iter().enumerate() {
                 if u {
-                    remap[i] = next;
-                    new_verts.push(vertices[vert_start + i]);
+                    welded_remap[i] = next;
+                    final_verts.push(welded_verts[i]);
                     next += 1;
                 }
             }
-            let remapped: Vec<u32> = new_idxs
+            let final_idxs: Vec<u32> = kept_idxs
                 .iter()
-                .map(|&i| remap[(i - vert_start as u32) as usize] + vert_start as u32)
+                .map(|&i| welded_remap[i as usize] + vert_start as u32)
                 .collect();
 
-            // Write filtered results back
+            // Write back
             vertices.truncate(vert_start);
-            vertices.extend_from_slice(&new_verts);
+            vertices.extend_from_slice(&final_verts);
             indices.truncate(idx_start);
-            indices.extend_from_slice(&remapped);
+            indices.extend_from_slice(&final_idxs);
         }
     }
 
