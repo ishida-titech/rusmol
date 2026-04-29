@@ -51,10 +51,12 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     let V = normalize(u.camera_pos.xyz - in.world_pos);
     let H = normalize(L + V);
 
-    let half_diff = dot(N, L) * 0.90 + 0.10;
-    let ambient  = 0.10;
-    let diffuse  = half_diff * 1.25;
-    let specular = pow(max(dot(N, H), 0.0), 80.0) * 0.85;
+    // Semi-transparent surface: soft diffuse + high ambient + minimal specular.
+    // Strong specular (glass-like) is inappropriate here — the surface should
+    // look like a colored veil, not a reflective shell.
+    let ambient  = 0.30;
+    let diffuse  = max(dot(N, L), 0.0) * 0.60;
+    let specular = pow(max(dot(N, H), 0.0), 24.0) * 0.10;
     let lit = (ambient + diffuse + specular) * u.light_intensity;
     var color = in.color * lit;
 
