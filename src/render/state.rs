@@ -357,10 +357,10 @@ impl RenderState {
             cache: None,
         });
 
-        // ── Surface pipeline (alpha-blend into MSAA HDR target) ──────────────
-        // Renders after opaque geometry in the same MSAA pass. depth_write_enabled
-        // ensures only the nearest surface fragment per pixel is blended, giving
-        // a uniform single-layer alpha across the entire mesh.
+        // ── Surface pipeline (alpha-blend into single-sample scene_color_tex) ──
+        // Rendered AFTER depth resolve + SSAO, so SSAO and Sobel edge only see
+        // opaque geometry depth — the surface gets no dark outlines or AO.
+        // depth_write_enabled: false → depth_single_tex stays opaque-only for Post.
         let surface_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("SurfaceShader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/surface.wgsl").into()),
@@ -391,12 +391,12 @@ impl RenderState {
             },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
+                depth_write_enabled: false,   // keep depth_single_tex opaque-only
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
-            multisample: wgpu::MultisampleState { count: 4, mask: !0, alpha_to_coverage_enabled: false },
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
             multiview: None,
             cache: None,
         });
@@ -1111,15 +1111,6 @@ impl RenderState {
                 pass.set_index_buffer(self.sphere_ib.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.sphere_index_count, 0, 0..self.sphere_instance_count);
             }
-
-            // Draw surface (alpha-blend, depth test+write — only nearest layer per pixel)
-            if let (Some(vb), Some(ib)) = (&self.surface_vb, &self.surface_ib) {
-                pass.set_pipeline(&self.surface_pipeline);
-                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                pass.set_vertex_buffer(0, vb.slice(..));
-                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..self.surface_index_count, 0, 0..1);
-            }
         }
 
         // ── Pass 2: Depth resolve (MSAA → single-sample) ──────────────────────
@@ -1163,7 +1154,42 @@ impl RenderState {
             pass.draw(0..3, 0..1);
         }
 
-        // ── Pass 4: Post composite pass ───────────────────────────────────────
+        // ── Pass 4: Surface alpha-blend pass ─────────────────────────────────
+        // Renders AFTER depth resolve + SSAO so those passes only see opaque
+        // geometry depth.  Uses depth_single_tex for depth test (no write) and
+        // alpha-blends directly onto scene_color_tex.
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("SurfacePass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.scene_color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_single_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Discard, // no write — keep opaque-only depth
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            if let (Some(vb), Some(ib)) = (&self.surface_vb, &self.surface_ib) {
+                pass.set_pipeline(&self.surface_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.surface_index_count, 0, 0..1);
+            }
+        }
+
+        // ── Pass 5: Post composite pass ───────────────────────────────────────
         // SSAO + Sobel edge + ACES → output_view (sRGB)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1185,7 +1211,7 @@ impl RenderState {
             pass.draw(0..3, 0..1);
         }
 
-        // ── Pass 5: egui overlay ──────────────────────────────────────────────
+        // ── Pass 6: egui overlay ──────────────────────────────────────────────
         {
             let mut pass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
