@@ -1173,7 +1173,9 @@ impl RenderState {
                     view: &self.depth_single_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Discard, // no write — keep opaque-only depth
+                        // Store (not Discard): Metal TBR discards tile memory on Discard,
+                        // making depth_single_tex undefined for the Post pass Sobel read.
+                        store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
                 }),
