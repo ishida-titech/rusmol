@@ -9,10 +9,21 @@ use crate::structure::atom::{SecondaryStructure, Structure};
 const N_SUB: usize = 16;
 /// Number of vertices in each cross-section ring.
 const N_PROF: usize = 24;
-/// Maximum Cα–Cα distance (Å) before treating as a chain break.
-const BREAK_DIST: f32 = 5.0;
 /// Number of spline steps that form the β-sheet arrow (≈ last 1 Cα interval).
 const N_ARROW_STEPS: usize = N_SUB;
+
+/// Returns true if two consecutive residues (sorted by seq_num) are sequential.
+pub fn residues_consecutive(seq1: i32, seq2: i32) -> bool {
+    seq2 - seq1 == 1
+}
+
+/// A gap between two non-consecutive residues, for dashed-line rendering.
+pub struct RibbonGap {
+    pub p1: [f32; 3],
+    pub p2: [f32; 3],
+    pub color1: [f32; 3],
+    pub color2: [f32; 3],
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -49,6 +60,7 @@ pub fn build_ribbon(
     atom_rep_show: &[u8],
     vertices: &mut Vec<RibbonVertex>,
     indices: &mut Vec<u32>,
+    gaps: &mut Vec<RibbonGap>,
 ) {
     // Single pass over ALL atoms to collect per-chain residue data.
     // Do NOT use chain_ranges: in PDB files HETATM records (ligands, waters)
@@ -99,14 +111,21 @@ pub fn build_ribbon(
             continue;
         }
 
-        // Split at chain breaks (CA–CA distance > BREAK_DIST)
+        // Split at chain breaks (non-consecutive residue numbers)
         let mut segments: Vec<Vec<(i32, Option<char>, usize, Option<usize>)>> = Vec::new();
         let mut current = vec![sorted[0]];
 
         for i in 1..sorted.len() {
-            let p_prev = structure.atoms[sorted[i - 1].2].position;
-            let p_curr = structure.atoms[sorted[i].2].position;
-            if (p_curr - p_prev).length() > BREAK_DIST {
+            if !residues_consecutive(sorted[i - 1].0, sorted[i].0) {
+                // Record the gap for dashed-line rendering
+                let ca_prev = sorted[i - 1].2;
+                let ca_curr = sorted[i].2;
+                gaps.push(RibbonGap {
+                    p1: structure.atoms[ca_prev].position.to_array(),
+                    p2: structure.atoms[ca_curr].position.to_array(),
+                    color1: atom_colors[ca_prev],
+                    color2: atom_colors[ca_curr],
+                });
                 segments.push(std::mem::take(&mut current));
             }
             current.push(sorted[i]);

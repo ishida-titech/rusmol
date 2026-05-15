@@ -1,4 +1,6 @@
-// Cylinder shader — PBR (GGX Cook-Torrance).
+// Sphere Impostor shader — PBR (GGX Cook-Torrance).
+// Billboard quads (6 verts/instance, no mesh buffer) with ray-sphere intersection
+// in the fragment shader for correct normals, depth, and physically based lighting.
 
 struct Uniforms {
     view_proj:         mat4x4<f32>,   // offset   0
@@ -26,41 +28,25 @@ struct Uniforms {
 @group(1) @binding(0) var shadow_map:  texture_depth_2d;
 @group(1) @binding(1) var shadow_samp: sampler_comparison;
 
-struct VertIn {
-    @location(0) position:  vec3<f32>,
-    @location(1) normal:    vec3<f32>,
-    // instance
-    @location(2) start_r:   vec4<f32>,  // xyz=start, w=radius
-    @location(3) end_pad:   vec4<f32>,  // xyz=end,   w=unused
-    @location(4) color_pad: vec4<f32>,  // xyz=color, w=unused
+struct InstIn {
+    @location(0) inst_pos:    vec3<f32>,
+    @location(1) inst_radius: f32,
+    @location(2) inst_color:  vec3<f32>,
+    @location(3) edge_boost:  f32,
 }
 
 struct VertOut {
-    @builtin(position) clip_pos:     vec4<f32>,
-    @location(0)       world_pos:    vec3<f32>,
-    @location(1)       world_normal: vec3<f32>,
-    @location(2)       color:        vec3<f32>,
-    @location(3)       edge_boost:   f32,
+    @builtin(position) clip_pos:      vec4<f32>,
+    @location(0)       sphere_center: vec3<f32>,
+    @location(1)       sphere_radius: f32,
+    @location(2)       color:         vec3<f32>,
+    @location(3)       billboard_pos: vec3<f32>,
+    @location(4)       edge_boost:    f32,
 }
 
-/// Rodrigues rotation: rotate `v` so that Y-axis maps to `dir`.
-fn rotate_y_to(v: vec3<f32>, dir: vec3<f32>) -> vec3<f32> {
-    let y = vec3<f32>(0.0, 1.0, 0.0);
-    let c = dot(y, dir);
-    if c > 0.9999 { return v; }
-    if c < -0.9999 { return vec3<f32>(v.x, -v.y, v.z); }
-
-    let ax  = normalize(cross(y, dir));
-    let s   = sqrt(max(0.0, 1.0 - c * c));
-    let t   = 1.0 - c;
-    let ax_ = ax.x; let ay_ = ax.y; let az_ = ax.z;
-
-    let rot = mat3x3<f32>(
-        vec3<f32>(t*ax_*ax_ + c,       t*ax_*ay_ + s*az_, t*ax_*az_ - s*ay_),
-        vec3<f32>(t*ax_*ay_ - s*az_,   t*ay_*ay_ + c,     t*ay_*az_ + s*ax_),
-        vec3<f32>(t*ax_*az_ + s*ay_,   t*ay_*az_ - s*ax_, t*az_*az_ + c    )
-    );
-    return rot * v;
+struct FragOut {
+    @builtin(frag_depth) depth: f32,
+    @location(0)         color: vec4<f32>,
 }
 
 // ── Shadow sampling ──────────────────────────────────────────────────────────
@@ -107,6 +93,7 @@ fn F_Schlick(cos_theta: f32, F0: vec3<f32>) -> vec3<f32> {
     return F0 + (vec3(1.0) - F0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
+// Cook-Torrance BRDF with half-Lambert diffuse wrap (direct light only, no ambient).
 fn pbr_direct(
     N: vec3<f32>, V: vec3<f32>, L: vec3<f32>,
     albedo: vec3<f32>, roughness: f32, metallic: f32,
@@ -132,63 +119,81 @@ fn pbr_direct(
     return (diffuse + spec * NdotL) * light_intensity;
 }
 
+// Hemispherical IBL: sky_color from above (camera_up), ground_color from below.
+// Diffuse irradiance + approximate specular reflection from the environment.
 fn pbr_ibl(N: vec3<f32>, V: vec3<f32>, albedo: vec3<f32>, roughness: f32, metallic: f32) -> vec3<f32> {
-    let F0         = mix(vec3(0.04), albedo, metallic);
+    let F0 = mix(vec3(0.04), albedo, metallic);
+
+    // Diffuse IBL: hemisphere weighted by normal vs camera_up
     let NdotUp     = dot(N, u.camera_up);
     let sky_w      = clamp(0.5 + 0.5 * NdotUp, 0.0, 1.0);
     let irradiance = mix(u.ground_color, u.sky_color, sky_w);
     let F_diff     = F_Schlick(max(dot(N, V), 0.0), F0);
     let kD         = (vec3(1.0) - F_diff) * (1.0 - metallic);
-    let diffuse_ibl  = kD * albedo * irradiance;
-    let R            = reflect(-V, N);
-    let RdotUp       = clamp(0.5 + 0.5 * dot(R, u.camera_up), 0.0, 1.0);
-    let env_col      = mix(u.ground_color, u.sky_color, RdotUp);
-    let spec_fac     = (1.0 - roughness) * (1.0 - roughness);
+    let diffuse_ibl = kD * albedo * irradiance;
+
+    // Specular IBL: reflection direction samples hemisphere
+    let R          = reflect(-V, N);
+    let RdotUp     = clamp(0.5 + 0.5 * dot(R, u.camera_up), 0.0, 1.0);
+    let env_col    = mix(u.ground_color, u.sky_color, RdotUp);
+    let spec_fac   = (1.0 - roughness) * (1.0 - roughness);
     let specular_ibl = F_diff * env_col * spec_fac;
+
     return (diffuse_ibl + specular_ibl) * u.ibl_intensity;
 }
 
 // ── Vertex ────────────────────────────────────────────────────────────────────
 
 @vertex
-fn vs_main(in: VertIn) -> VertOut {
-    let start  = in.start_r.xyz;
-    let radius = in.start_r.w;
-    let end    = in.end_pad.xyz;
-    let color  = in.color_pad.xyz;
-
-    let axis   = end - start;
-    let length = length(axis);
-    let dir    = select(vec3<f32>(0.0, 1.0, 0.0), normalize(axis), length > 0.0001);
-    let center = (start + end) * 0.5;
-
-    let scaled = vec3<f32>(
-        in.position.x * radius,
-        in.position.y * length,
-        in.position.z * radius,
+fn vs_main(inst: InstIn, @builtin(vertex_index) vid: u32) -> VertOut {
+    let offsets = array<vec2<f32>, 6>(
+        vec2(-1.0, -1.0), vec2( 1.0, -1.0), vec2(-1.0,  1.0),
+        vec2(-1.0,  1.0), vec2( 1.0, -1.0), vec2( 1.0,  1.0),
     );
-    let world_pos    = rotate_y_to(scaled, dir) + center;
-    let mesh_normal  = normalize(vec3<f32>(in.normal.x, 0.0, in.normal.z));
-    let world_normal = rotate_y_to(mesh_normal, dir);
+    let uv = offsets[vid];
+
+    let half_ext = inst.inst_radius * 1.15;
+    let corner   = inst.inst_pos
+        + u.camera_right * (uv.x * half_ext)
+        + u.camera_up    * (uv.y * half_ext);
 
     var out: VertOut;
-    out.clip_pos     = u.view_proj * vec4<f32>(world_pos, 1.0);
-    out.world_pos    = world_pos;
-    out.world_normal = world_normal;
-    out.color        = color;
-    out.edge_boost   = in.color_pad.w;
+    out.clip_pos      = u.view_proj * vec4<f32>(corner, 1.0);
+    out.sphere_center = inst.inst_pos;
+    out.sphere_radius = inst.inst_radius;
+    out.color         = inst.inst_color;
+    out.billboard_pos = corner;
+    out.edge_boost    = inst.edge_boost;
     return out;
 }
 
 // ── Fragment ──────────────────────────────────────────────────────────────────
 
 @fragment
-fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
-    let N = normalize(in.world_normal);
-    let L = normalize(u.light_dir);
-    let V = normalize(u.camera_pos - in.world_pos);
+fn fs_main(in: VertOut) -> FragOut {
+    // Ray-sphere intersection
+    let ray_orig = u.camera_pos;
+    let ray_dir  = normalize(in.billboard_pos - u.camera_pos);
 
-    let shadow = mix(1.0, shadow_factor(in.world_pos), u.shadow_strength);
+    let oc   = ray_orig - in.sphere_center;
+    let b    = dot(oc, ray_dir);
+    let c    = dot(oc, oc) - in.sphere_radius * in.sphere_radius;
+    let disc = b * b - c;
+    if disc < 0.0 { discard; }
+
+    let sq     = sqrt(disc);
+    let t_near = -b - sq;
+    let t_far  = -b + sq;
+    if t_far < 0.0 { discard; }
+
+    let t   = select(t_far, t_near, t_near >= 0.0);
+    let hit = ray_orig + t * ray_dir;
+    let N   = (hit - in.sphere_center) / in.sphere_radius;
+
+    let L = normalize(u.light_dir);
+    let V = normalize(u.camera_pos - hit);
+
+    let shadow = mix(1.0, shadow_factor(hit), u.shadow_strength);
     var color = shadow * pbr_direct(N, V, L, in.color, u.roughness, u.metallic, u.light_intensity)
              + pbr_ibl(N, V, in.color, u.roughness, u.metallic);
 
@@ -198,5 +203,11 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     let edge_dark = clamp(pow(1.0 - nv, 6.0) * 0.40 * eff_edge, 0.0, 1.0);
     color *= 1.0 - edge_dark;
 
-    return vec4<f32>(color, 1.0);
+    // Correct clip-space depth from sphere surface
+    let clip_hit = u.view_proj * vec4<f32>(hit, 1.0);
+
+    var out: FragOut;
+    out.depth = clip_hit.z / clip_hit.w;
+    out.color = vec4<f32>(color, 1.0);
+    return out;
 }

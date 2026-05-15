@@ -42,6 +42,10 @@ pub enum Command {
     /// PyMOL-compatible: `set name, value`
     /// Supported names: transparency, surface_transparency
     Set { name: String, value: f32 },
+    /// PyMOL-compatible: `set surface_color|cartoon_color, color[, sel]`
+    /// color=None means reset to per-atom colors ("default").
+    SetColor { rep: String, color: Option<[f32; 3]>, sel: Option<String> },
+    Help,
     Quit,
 }
 

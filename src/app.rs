@@ -82,7 +82,7 @@ impl ApplicationHandler for App {
                 .create_window(
                     Window::default_attributes()
                         .with_title("rusmol")
-                        .with_inner_size(PhysicalSize::new(1200u32, 1600u32)),
+                        .with_inner_size(PhysicalSize::new(1600u32, 1600u32)),
                 )
                 .expect("Failed to create window"),
         );
@@ -237,12 +237,40 @@ impl ApplicationHandler for App {
                         .min_height(40.0)
                         .show(ctx, |ui| {
                             ui.horizontal_centered(|ui| {
-                                if ui.button("初期表示").clicked() {
+                                if ui.button("Default").clicked() {
                                     preset_action = Some(0);
                                 }
                                 ui.add_space(8.0);
                                 if ui.button("Chain Surface").clicked() {
                                     preset_action = Some(1);
+                                }
+                                ui.add_space(8.0);
+                                if ui.button("Binding Site").clicked() {
+                                    preset_action = Some(2);
+                                }
+                                ui.add_space(8.0);
+                                if ui.button("Pocket Surface").clicked() {
+                                    preset_action = Some(3);
+                                }
+                                ui.separator();
+                                if ui.button("All Reps").clicked() {
+                                    preset_action = Some(10);
+                                }
+                                ui.add_space(4.0);
+                                if ui.button("Backbone+Surface").clicked() {
+                                    preset_action = Some(11);
+                                }
+                                ui.add_space(4.0);
+                                if ui.button("Lines").clicked() {
+                                    preset_action = Some(12);
+                                }
+                                ui.add_space(4.0);
+                                if ui.button("Spectrum").clicked() {
+                                    preset_action = Some(14);
+                                }
+                                ui.add_space(4.0);
+                                if ui.button("Neon Glow").clicked() {
+                                    preset_action = Some(15);
                                 }
                             });
                         });
@@ -265,10 +293,52 @@ impl ApplicationHandler for App {
 
                 // Apply preset after rendering (scene re-upload on next about_to_wait)
                 if let Some(preset) = preset_action {
+                    let bg: Option<wgpu::Color> = match preset {
+                        10 => Some(wgpu::Color { r: 1.00, g: 1.00, b: 1.00, a: 1.0 }), // white
+                        11 => Some(wgpu::Color { r: 0.72, g: 0.72, b: 0.72, a: 1.0 }), // light gray
+                        12 => Some(wgpu::Color { r: 0.22, g: 0.22, b: 0.22, a: 1.0 }), // dark gray
+                        14 => Some(wgpu::Color { r: 0.05, g: 0.25, b: 0.70, a: 1.0 }), // vivid blue
+                        15 => Some(wgpu::Color { r: 0.02, g: 0.02, b: 0.05, a: 1.0 }), // near-black
+                        _  => None,
+                    };
+                    if let Some(c) = bg {
+                        render.bg_color = c;
+                    }
+                    // Surface alpha per preset (Chain Surface intentionally excluded)
                     match preset {
-                        0 => apply_default_view(&mut self.scene),
-                        1 => apply_chain_surface_view(&mut self.scene),
-                        _ => {}
+                        3  => render.surface_alpha = 0.75, // Pocket Surface
+                        10 => render.surface_alpha = 0.55, // All Reps
+                        11 => render.surface_alpha = 0.70, // Backbone+Surface
+                        _  => {}
+                    }
+                    // Bloom & lighting: Neon Glow uses strong bloom; others reset
+                    match preset {
+                        15 => {
+                            render.bloom_threshold = 0.4;
+                            render.bloom_intensity = 0.6;
+                            render.light_intensity = 1.8;
+                            render.ibl_intensity = 1.5;
+                            render.edge_strength = 0.0;
+                        }
+                        _ => {
+                            render.bloom_threshold = 1.0;
+                            render.bloom_intensity = 0.0;
+                            render.light_intensity = 1.0;
+                            render.ibl_intensity = 1.0;
+                            render.edge_strength = 1.0;
+                        }
+                    }
+                    match preset {
+                        0  => apply_default_view(&mut self.scene),
+                        1  => apply_chain_surface_view(&mut self.scene),
+                        2  => apply_binding_site_view(&mut self.scene),
+                        3  => apply_pocket_surface_view(&mut self.scene),
+                        10 => apply_all_reps_view(&mut self.scene),
+                        11 => apply_backbone_surface_view(&mut self.scene),
+                        12 => apply_lines_view(&mut self.scene),
+                        14 => apply_spectrum_view(&mut self.scene),
+                        15 => apply_neon_glow_view(&mut self.scene),
+                        _  => {}
                     }
                     self.scene_dirty = true;
                 }
@@ -313,11 +383,41 @@ impl ApplicationHandler for App {
                         match name.as_str() {
                             "transparency" | "surface_transparency" => {
                                 render.surface_alpha = (1.0 - value).clamp(0.0, 1.0);
-                                window.request_redraw();
+                            }
+                            "edge_strength" => {
+                                render.edge_strength = value.max(0.0);
+                            }
+                            "roughness" => {
+                                render.roughness = value.clamp(0.0, 1.0);
+                            }
+                            "metallic" => {
+                                render.metallic = value.clamp(0.0, 1.0);
+                            }
+                            "ibl_intensity" => {
+                                render.ibl_intensity = value.max(0.0);
+                            }
+                            "shadow_strength" | "shadow" => {
+                                render.shadow_strength = value.clamp(0.0, 1.0);
+                            }
+                            "bloom_threshold" => {
+                                render.bloom_threshold = value.max(0.0);
+                            }
+                            "bloom_intensity" | "bloom" => {
+                                render.bloom_intensity = value.max(0.0);
                             }
                             _ => {}
                         }
+                        window.request_redraw();
                     }
+                    if let Some(tx) = &self.resp_tx {
+                        let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
+                    }
+                    continue;
+                }
+
+                if let Command::SetColor { ref rep, color, ref sel } = cmd {
+                    apply_set_color(&mut self.scene, rep, color, sel.as_deref());
+                    self.scene_dirty = true;
                     if let Some(tx) = &self.resp_tx {
                         let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
                     }
@@ -433,9 +533,35 @@ impl App {
                             "transparency" | "surface_transparency" => {
                                 render.surface_alpha = (1.0 - value).clamp(0.0, 1.0);
                             }
+                            "edge_strength" => {
+                                render.edge_strength = value.max(0.0);
+                            }
+                            "roughness" => {
+                                render.roughness = value.clamp(0.0, 1.0);
+                            }
+                            "metallic" => {
+                                render.metallic = value.clamp(0.0, 1.0);
+                            }
+                            "ibl_intensity" => {
+                                render.ibl_intensity = value.max(0.0);
+                            }
+                            "shadow_strength" | "shadow" => {
+                                render.shadow_strength = value.clamp(0.0, 1.0);
+                            }
+                            "bloom_threshold" => {
+                                render.bloom_threshold = value.max(0.0);
+                            }
+                            "bloom_intensity" | "bloom" => {
+                                render.bloom_intensity = value.max(0.0);
+                            }
                             _ => {}
                         }
                     }
+                    return;
+                }
+                if let Command::SetColor { ref rep, color, ref sel } = cmd {
+                    apply_set_color(&mut self.scene, rep, color, sel.as_deref());
+                    self.scene_dirty = true;
                     return;
                 }
                 let AppState::Running { camera, .. } = &mut self.state else { return };
@@ -526,6 +652,380 @@ fn apply_chain_surface_view(scene: &mut Scene) {
             } else {
                 cpk_color(&atom.element)
             };
+        }
+    }
+}
+
+/// Collect world-space positions of all ligand (non-water HETATM) atoms across the scene.
+fn collect_ligand_positions(scene: &Scene) -> Vec<glam::Vec3> {
+    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
+    let mut positions = Vec::new();
+    for (_, obj) in scene.iter() {
+        for atom in &obj.structure.atoms {
+            if !atom.is_hetatm { continue; }
+            if WATERS.contains(&atom.residue.name.trim()) { continue; }
+            positions.push(atom.position);
+        }
+    }
+    positions
+}
+
+/// Check if an atom is within `cutoff` Å of any ligand position.
+fn is_near_ligand(pos: glam::Vec3, ligand_positions: &[glam::Vec3], cutoff: f32) -> bool {
+    let cutoff_sq = cutoff * cutoff;
+    ligand_positions.iter().any(|lp| pos.distance_squared(*lp) <= cutoff_sq)
+}
+
+/// Build a set of residue keys that have at least one atom near a ligand.
+/// Returns a HashSet of (chain, seq_num, ins_code).
+fn near_ligand_residues(
+    obj: &crate::scene::object::MolecularObject,
+    ligand_positions: &[glam::Vec3],
+    cutoff: f32,
+) -> std::collections::HashSet<(char, i32, Option<char>)> {
+    let mut residues = std::collections::HashSet::new();
+    for atom in &obj.structure.atoms {
+        if !obj.structure.is_polymer_atom(atom) { continue; }
+        if is_near_ligand(atom.position, ligand_positions, cutoff) {
+            residues.insert((atom.residue.chain, atom.residue.seq_num, atom.residue.ins_code));
+        }
+    }
+    residues
+}
+
+/// Preset 3: Binding Site — ligand BallAndStick + nearby protein residues BallAndStick.
+/// - Ligand: BallAndStick + CPK colors
+/// - Protein within 5 Å of ligand (by residue): BallAndStick + chain color
+/// - Remaining protein: Ribbon + dim gray
+/// - Water: hidden
+fn apply_binding_site_view(scene: &mut Scene) {
+    use crate::scene::object::{REP_BALL_STICK, REP_RIBBON};
+    use crate::util::color::cpk_color;
+    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
+    const CUTOFF: f32 = 5.0;
+    const DIM_GRAY: [f32; 3] = [0.75, 0.75, 0.75];
+
+    let ligand_positions = collect_ligand_positions(scene);
+
+    // Build chain → color index map (stable across objects)
+    let mut chain_index: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
+    let mut next_idx = 0usize;
+    for (_, obj) in scene.iter() {
+        for atom in &obj.structure.atoms {
+            if obj.structure.is_polymer_atom(atom) {
+                chain_index.entry(atom.residue.chain).or_insert_with(|| {
+                    let i = next_idx; next_idx += 1; i
+                });
+            }
+        }
+    }
+
+    // Collect near-ligand residues per object (need separate pass because borrow rules)
+    let near_residues: std::collections::HashMap<String, std::collections::HashSet<(char, i32, Option<char>)>> =
+        scene.iter().map(|(name, obj)| {
+            (name.clone(), near_ligand_residues(obj, &ligand_positions, CUTOFF))
+        }).collect();
+
+    for (name, obj) in scene.iter_mut() {
+        let near = near_residues.get(name).cloned().unwrap_or_default();
+        for (i, atom) in obj.structure.atoms.iter().enumerate() {
+            let is_water = WATERS.contains(&atom.residue.name.trim());
+            let is_polymer = obj.structure.is_polymer_atom(atom);
+            let res_key = (atom.residue.chain, atom.residue.seq_num, atom.residue.ins_code);
+
+            if is_water {
+                obj.atom_rep_show[i] = 0;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            } else if !is_polymer {
+                // Ligand
+                obj.atom_rep_show[i] = REP_BALL_STICK;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            } else if near.contains(&res_key) {
+                // Near-ligand protein residue
+                obj.atom_rep_show[i] = REP_BALL_STICK;
+                let idx = chain_index.get(&atom.residue.chain).copied().unwrap_or(0);
+                obj.atom_colors[i] = crate::util::color::chain_color(idx);
+            } else {
+                // Distant protein
+                obj.atom_rep_show[i] = REP_RIBBON;
+                obj.atom_colors[i] = DIM_GRAY;
+            }
+        }
+    }
+}
+
+/// Preset 4: Pocket Surface — ligand BallAndStick + nearby protein residues as Surface.
+/// - Ligand: BallAndStick + CPK colors
+/// - Protein within 6 Å of ligand (by residue): Surface + CPK element colors
+/// - Remaining protein: Ribbon + dim gray
+/// - Water: hidden
+fn apply_pocket_surface_view(scene: &mut Scene) {
+    use crate::scene::object::{REP_BALL_STICK, REP_RIBBON, REP_SURFACE};
+    use crate::util::color::cpk_color;
+    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
+    const CUTOFF: f32 = 6.0;
+    const DIM_GRAY: [f32; 3] = [0.75, 0.75, 0.75];
+
+    let ligand_positions = collect_ligand_positions(scene);
+
+    let near_residues: std::collections::HashMap<String, std::collections::HashSet<(char, i32, Option<char>)>> =
+        scene.iter().map(|(name, obj)| {
+            (name.clone(), near_ligand_residues(obj, &ligand_positions, CUTOFF))
+        }).collect();
+
+    for (name, obj) in scene.iter_mut() {
+        let near = near_residues.get(name).cloned().unwrap_or_default();
+        for (i, atom) in obj.structure.atoms.iter().enumerate() {
+            let is_water = WATERS.contains(&atom.residue.name.trim());
+            let is_polymer = obj.structure.is_polymer_atom(atom);
+            let res_key = (atom.residue.chain, atom.residue.seq_num, atom.residue.ins_code);
+
+            if is_water {
+                obj.atom_rep_show[i] = 0;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            } else if !is_polymer {
+                obj.atom_rep_show[i] = REP_BALL_STICK;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            } else if near.contains(&res_key) {
+                obj.atom_rep_show[i] = REP_SURFACE;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            } else {
+                obj.atom_rep_show[i] = REP_RIBBON;
+                obj.atom_colors[i] = DIM_GRAY;
+            }
+        }
+    }
+}
+
+/// Preset 5: B-Factor — Ribbon colored by B-factor + ligand BallAndStick.
+/// - Protein: Ribbon + B-factor colors (blue=low → white=mid → red=high)
+/// - Ligand: BallAndStick + CPK colors
+/// - Water: hidden
+// ── Dev presets ──────────────────────────────────────────────────────────────
+
+/// Dev preset: All Reps — show Ribbon + Surface + Backbone simultaneously on polymer.
+fn apply_all_reps_view(scene: &mut Scene) {
+    use crate::scene::object::{REP_BACKBONE, REP_BALL_STICK, REP_RIBBON, REP_SURFACE};
+    use crate::structure::atom::SecondaryStructure;
+    use crate::util::color::{cpk_color, ss_color};
+    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
+
+    for (_, obj) in scene.iter_mut() {
+        for (i, atom) in obj.structure.atoms.iter().enumerate() {
+            let is_water = WATERS.contains(&atom.residue.name.trim());
+            if is_water {
+                obj.atom_rep_show[i] = 0;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            } else if obj.structure.is_polymer_atom(atom) {
+                obj.atom_rep_show[i] = REP_RIBBON | REP_SURFACE | REP_BACKBONE;
+                let ss = obj.structure.ss.get(i).copied().unwrap_or(SecondaryStructure::Coil);
+                obj.atom_colors[i] = ss_color(ss);
+            } else {
+                obj.atom_rep_show[i] = REP_BALL_STICK;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            }
+        }
+    }
+}
+
+/// Dev preset: Backbone + Surface — Cα trace inside transparent surface.
+fn apply_backbone_surface_view(scene: &mut Scene) {
+    use crate::scene::object::{REP_BACKBONE, REP_BALL_STICK, REP_SURFACE};
+    use crate::util::color::{chain_color, cpk_color};
+    use std::collections::HashMap;
+    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
+
+    let mut chain_index: HashMap<char, usize> = HashMap::new();
+    let mut next_idx = 0usize;
+    for (_, obj) in scene.iter() {
+        for atom in &obj.structure.atoms {
+            if obj.structure.is_polymer_atom(atom) {
+                chain_index.entry(atom.residue.chain).or_insert_with(|| {
+                    let i = next_idx; next_idx += 1; i
+                });
+            }
+        }
+    }
+
+    for (_, obj) in scene.iter_mut() {
+        for (i, atom) in obj.structure.atoms.iter().enumerate() {
+            let is_water = WATERS.contains(&atom.residue.name.trim());
+            if is_water {
+                obj.atom_rep_show[i] = 0;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            } else if obj.structure.is_polymer_atom(atom) {
+                obj.atom_rep_show[i] = REP_BACKBONE | REP_SURFACE;
+                let idx = chain_index.get(&atom.residue.chain).copied().unwrap_or(0);
+                obj.atom_colors[i] = chain_color(idx);
+            } else {
+                obj.atom_rep_show[i] = REP_BALL_STICK;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            }
+        }
+    }
+}
+
+/// Dev preset: Lines — wireframe bond representation for everything.
+fn apply_lines_view(scene: &mut Scene) {
+    use crate::scene::object::REP_LINES;
+    use crate::util::color::{chain_color, cpk_color};
+    use std::collections::HashMap;
+    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
+
+    let mut chain_index: HashMap<char, usize> = HashMap::new();
+    let mut next_idx = 0usize;
+    for (_, obj) in scene.iter() {
+        for atom in &obj.structure.atoms {
+            if obj.structure.is_polymer_atom(atom) {
+                chain_index.entry(atom.residue.chain).or_insert_with(|| {
+                    let i = next_idx; next_idx += 1; i
+                });
+            }
+        }
+    }
+
+    for (_, obj) in scene.iter_mut() {
+        for (i, atom) in obj.structure.atoms.iter().enumerate() {
+            let is_water = WATERS.contains(&atom.residue.name.trim());
+            if is_water {
+                obj.atom_rep_show[i] = 0;
+            } else {
+                obj.atom_rep_show[i] = REP_LINES;
+                obj.atom_colors[i] = if obj.structure.is_polymer_atom(atom) {
+                    let idx = chain_index.get(&atom.residue.chain).copied().unwrap_or(0);
+                    chain_color(idx)
+                } else {
+                    cpk_color(&atom.element)
+                };
+            }
+        }
+    }
+}
+
+
+/// Dev preset: Spectrum — Ribbon with N→C rainbow gradient per chain.
+fn apply_spectrum_view(scene: &mut Scene) {
+    use crate::scene::object::{REP_BALL_STICK, REP_RIBBON};
+    use crate::util::color::cpk_color;
+    use std::collections::HashMap;
+    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
+
+    // First pass: set representations
+    for (_, obj) in scene.iter_mut() {
+        for (i, atom) in obj.structure.atoms.iter().enumerate() {
+            let is_water = WATERS.contains(&atom.residue.name.trim());
+            if is_water {
+                obj.atom_rep_show[i] = 0;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            } else if obj.structure.is_polymer_atom(atom) {
+                obj.atom_rep_show[i] = REP_RIBBON;
+                // colors assigned below
+            } else {
+                obj.atom_rep_show[i] = REP_BALL_STICK;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            }
+        }
+    }
+
+    // Second pass: compute per-chain spectrum gradient for polymer atoms
+    for (_, obj) in scene.iter_mut() {
+        // Group polymer atoms by chain → sorted by (seq_num, ins_code)
+        let mut groups: HashMap<char, Vec<(i32, Option<char>, usize)>> = HashMap::new();
+        for (i, atom) in obj.structure.atoms.iter().enumerate() {
+            if obj.structure.is_polymer_atom(atom) {
+                groups.entry(atom.residue.chain).or_default()
+                    .push((atom.residue.seq_num, atom.residue.ins_code, i));
+            }
+        }
+        for entries in groups.values_mut() {
+            entries.sort_unstable_by_key(|&(seq, ins, _)| (seq, ins));
+            let n = entries.len();
+            for (rank, &(_, _, atom_idx)) in entries.iter().enumerate() {
+                let t = if n > 1 { rank as f32 / (n - 1) as f32 } else { 0.5 };
+                obj.atom_colors[atom_idx] = spectrum_color(t);
+            }
+        }
+    }
+}
+
+/// Neon Glow preset: bright spectrum colors on dark background, designed for bloom.
+fn apply_neon_glow_view(scene: &mut Scene) {
+    use crate::scene::object::{REP_BALL_STICK, REP_RIBBON};
+    use crate::util::color::cpk_color;
+    use std::collections::HashMap;
+    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
+
+    // Ribbon for polymer, BallAndStick for ligands, hide water
+    for (_, obj) in scene.iter_mut() {
+        for (i, atom) in obj.structure.atoms.iter().enumerate() {
+            let is_water = WATERS.contains(&atom.residue.name.trim());
+            if is_water {
+                obj.atom_rep_show[i] = 0;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            } else if obj.structure.is_polymer_atom(atom) {
+                obj.atom_rep_show[i] = REP_RIBBON;
+            } else {
+                obj.atom_rep_show[i] = REP_BALL_STICK;
+                // Bright neon CPK for ligands
+                let c = cpk_color(&atom.element);
+                obj.atom_colors[i] = [c[0] * 1.5, c[1] * 1.5, c[2] * 1.5];
+            }
+        }
+    }
+
+    // Bright saturated spectrum colors for polymer (boosted for bloom)
+    for (_, obj) in scene.iter_mut() {
+        let mut groups: HashMap<char, Vec<(i32, Option<char>, usize)>> = HashMap::new();
+        for (i, atom) in obj.structure.atoms.iter().enumerate() {
+            if obj.structure.is_polymer_atom(atom) {
+                groups.entry(atom.residue.chain).or_default()
+                    .push((atom.residue.seq_num, atom.residue.ins_code, i));
+            }
+        }
+        for entries in groups.values_mut() {
+            entries.sort_unstable_by_key(|&(seq, ins, _)| (seq, ins));
+            let n = entries.len();
+            for (rank, &(_, _, atom_idx)) in entries.iter().enumerate() {
+                let t = if n > 1 { rank as f32 / (n - 1) as f32 } else { 0.5 };
+                let c = spectrum_color(t);
+                // Boost colors above 1.0 so they trigger bloom
+                obj.atom_colors[atom_idx] = [c[0] * 1.6, c[1] * 1.6, c[2] * 1.6];
+            }
+        }
+    }
+}
+
+/// HSV rainbow: t=0 → blue (240°), t=1 → red (0°).
+fn spectrum_color(t: f32) -> [f32; 3] {
+    let h = 240.0 * (1.0 - t.clamp(0.0, 1.0));
+    let h6 = h / 60.0;
+    let i = h6 as u32;
+    let f = h6 - i as f32;
+    match i {
+        0 => [1.0, f,   0.0],
+        1 => [1.0 - f, 1.0, 0.0],
+        2 => [0.0, 1.0, f],
+        3 => [0.0, 1.0 - f, 1.0],
+        4 => [f,   0.0, 1.0],
+        _ => [1.0, 0.0, 1.0 - f],
+    }
+}
+
+/// Apply a per-representation color override to matching objects.
+/// `rep`: "surface" or "ribbon".
+/// `color`: Some(rgb) to set override, None to reset to per-atom colors.
+/// `sel`: optional object name filter; None means all objects.
+fn apply_set_color(scene: &mut Scene, rep: &str, color: Option<[f32; 3]>, sel: Option<&str>) {
+    for (name, obj) in scene.iter_mut() {
+        if let Some(target) = sel {
+            if name != target {
+                continue;
+            }
+        }
+        match rep {
+            "surface" => obj.surface_color_override = color,
+            "ribbon"  => obj.ribbon_color_override  = color,
+            _ => {}
         }
     }
 }

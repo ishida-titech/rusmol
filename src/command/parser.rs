@@ -38,6 +38,7 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
         }
         "light" => parse_light(rest),
         "set"   => parse_set(rest),
+        "help" | "h" | "?" => Ok(Command::Help),
         "quit" | "q" | "exit" => Ok(Command::Quit),
         other => Err(format!("unknown command: '{other}'")),
     }
@@ -135,26 +136,43 @@ fn parse_color_spec(s: &str) -> Result<ColorSpec, String> {
     Err(format!("unknown color: '{s}'"))
 }
 
-/// Parse: `set name, value`
-/// Supported: transparency / surface_transparency (value 0=opaque .. 1=invisible)
+/// Parse: `set name, value[, sel]`
+/// Supported:
+///   transparency / surface_transparency  → Set { name, value: f32 }
+///   surface_color / cartoon_color        → SetColor { rep, color, sel }
 fn parse_set(rest: &str) -> Result<Command, String> {
     if rest.is_empty() {
         return Err("set: expected name, value".into());
     }
-    let parts = split_comma(rest, 2);
+    let parts = split_comma(rest, 3);
     if parts.len() < 2 {
         return Err("set: expected 'set name, value'".into());
     }
     let name = parts[0].trim().to_lowercase();
     let val_str = parts[1].trim();
-    let value: f32 = val_str
-        .parse()
-        .map_err(|_| format!("set: '{val_str}' is not a number"))?;
+
     match name.as_str() {
-        "transparency" | "surface_transparency" => {}
-        other => return Err(format!("set: unknown setting '{other}'")),
+        "surface_color" | "cartoon_color" | "ribbon_color" => {
+            let sel = parts.get(2).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            let rep = if name == "surface_color" { "surface" } else { "ribbon" }.to_string();
+            let color = if val_str.eq_ignore_ascii_case("default") {
+                None
+            } else {
+                Some(named_color(val_str)
+                    .ok_or_else(|| format!("set: unknown color '{val_str}'"))?)
+            };
+            Ok(Command::SetColor { rep, color, sel })
+        }
+        "transparency" | "surface_transparency" | "edge_strength" | "roughness" | "metallic"
+        | "ibl_intensity" | "shadow_strength" | "shadow"
+        | "bloom_threshold" | "bloom_intensity" | "bloom" => {
+            let value: f32 = val_str
+                .parse()
+                .map_err(|_| format!("set: '{val_str}' is not a number"))?;
+            Ok(Command::Set { name, value })
+        }
+        other => Err(format!("set: unknown setting '{other}'")),
     }
-    Ok(Command::Set { name, value })
 }
 
 /// Parse: `light [intensity <f>] [elevation <f>] [azimuth <f>]`

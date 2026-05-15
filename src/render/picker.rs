@@ -1,4 +1,4 @@
-use crate::render::ball_stick::{SphereInstance, Vertex};
+use crate::render::ball_stick::SphereInstance;
 
 /// Pixel radius for nearest-neighbor ghost-sphere search (Ribbon / Surface picking).
 pub const GHOST_PICK_RADIUS: u32 = 20;
@@ -28,8 +28,8 @@ impl Picker {
         bind_group_layout: &wgpu::BindGroupLayout,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("PickShader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/pick.wgsl").into()),
+            label: Some("PickImpostorShader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/pick_impostor.wgsl").into()),
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -39,13 +39,13 @@ impl Picker {
         });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("PickPipeline"),
+            label: Some("PickImpostorPipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[Vertex::desc(), SphereInstance::desc()],
+                buffers: &[SphereInstance::impostor_desc()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -59,7 +59,7 @@ impl Picker {
             }),
             primitive: wgpu::PrimitiveState {
                 topology: wgpu::PrimitiveTopology::TriangleList,
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None, // billboard faces camera; ray test handles misses
                 ..Default::default()
             },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -113,9 +113,6 @@ impl Picker {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         uniform_bind_group: &wgpu::BindGroup,
-        sphere_vb: &wgpu::Buffer,
-        sphere_ib: &wgpu::Buffer,
-        sphere_index_count: u32,
         sphere_instances: &wgpu::Buffer,
         sphere_instance_count: u32,
         px: u32,
@@ -152,10 +149,8 @@ impl Picker {
 
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, uniform_bind_group, &[]);
-            pass.set_vertex_buffer(0, sphere_vb.slice(..));
-            pass.set_vertex_buffer(1, sphere_instances.slice(..));
-            pass.set_index_buffer(sphere_ib.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..sphere_index_count, 0, 0..sphere_instance_count);
+            pass.set_vertex_buffer(0, sphere_instances.slice(..));
+            pass.draw(0..6, 0..sphere_instance_count);
         }
 
         // ── Copy single pixel to readback buffer ─────────────────────────────
@@ -203,9 +198,6 @@ impl Picker {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         uniform_bind_group: &wgpu::BindGroup,
-        sphere_vb: &wgpu::Buffer,
-        sphere_ib: &wgpu::Buffer,
-        sphere_index_count: u32,
         sphere_instances: &wgpu::Buffer,
         sphere_instance_count: u32,
         px: u32,
@@ -251,10 +243,8 @@ impl Picker {
 
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, uniform_bind_group, &[]);
-            pass.set_vertex_buffer(0, sphere_vb.slice(..));
-            pass.set_vertex_buffer(1, sphere_instances.slice(..));
-            pass.set_index_buffer(sphere_ib.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..sphere_index_count, 0, 0..sphere_instance_count);
+            pass.set_vertex_buffer(0, sphere_instances.slice(..));
+            pass.draw(0..6, 0..sphere_instance_count);
         }
 
         // ── Copy region to region_readback_buf ───────────────────────────────

@@ -78,11 +78,20 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                 ), false);
             }
             let bit = repr.to_bit();
-            let n = atoms.len();
+            // When no selector is given, skip water molecules — they are hidden by
+            // default and their red CPK oxygen color would corrupt surface colors.
+            let skip_water = sel.is_none();
+            const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
+            let mut n = 0usize;
             for (obj_name, atom_idx) in &atoms {
                 if let Some(obj) = scene.get_mut(obj_name) {
+                    if skip_water {
+                        let rn = obj.structure.atoms[*atom_idx].residue.name.trim();
+                        if WATERS.contains(&rn) { continue; }
+                    }
                     if let Some(f) = obj.atom_rep_show.get_mut(*atom_idx) {
                         *f |= bit;
+                        n += 1;
                     }
                 }
             }
@@ -275,8 +284,81 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
         Command::Background(_) => (CommandResponse::Ok(String::new()), false),
         Command::Light { .. }  => (CommandResponse::Ok(String::new()), false),
         Command::Set { .. }    => (CommandResponse::Ok(String::new()), false),
+        Command::SetColor { .. } => (CommandResponse::Ok(String::new()), false),
+        Command::Help => (CommandResponse::Ok(help_text()), false),
         Command::Quit => (CommandResponse::Ok("bye".into()), false),
     }
+}
+
+fn help_text() -> String {
+    "\
+─────────────────────────────────────────────────────────────────
+ rusmol — コマンド一覧
+─────────────────────────────────────────────────────────────────
+ ファイル
+   load <path> [, name]          PDB ファイルを読み込む
+
+ 表示制御
+   show <repr> [, sel]           表現を表示
+   hide <repr> [, sel]           表現を非表示
+   enable <obj>                  オブジェクト全体を表示
+   disable <obj>                 オブジェクト全体を非表示
+   delete <obj>                  オブジェクトを削除
+
+   表現名: ribbon / cartoon  ball_stick / bs / sticks
+           backbone / trace  surface  lines
+
+ 選択
+   select [name,] <expr>         選択セットを作成 (デフォルト名: sele)
+   sel    [name,] <expr>         同上 (短縮形)
+
+   選択式: all  chain <C>  resn <name>  resi <num|range>
+           name <atom>  elem <E>  hetatm  not  and  or  ( )
+           例: chain A and resn ALA
+               resi 1-50 or (hetatm and not resn HOH)
+
+ 色
+   color <spec> [, sel]          色を変更
+   colour <spec> [, sel]         同上 (別綴り)
+
+   色指定: element / cpk         CPK 元素色
+           chain / chainbows     チェーン色
+           ss / secondary        二次構造色 (helix=赤, sheet=黄, coil=灰)
+           spectrum / rainbow    N末端(青)→C末端(赤) レインボー
+           b / bfactor           B 因子 (青=低 → 白 → 赤=高)
+           red  green  blue  white  black  yellow  orange
+           purple  cyan  grey  pink  salmon  teal  marine  forest
+
+ カメラ
+   zoom [sel]                    選択 / 全体にフィット
+   reset                         カメラをデフォルト位置に戻す
+
+ ライト
+   light [intensity <f>] [elevation <f>] [azimuth <f>]
+                                 光源の強度・仰角・方位角を調整
+
+ パラメータ設定
+   set transparency, <0-1>       サーフェス透明度 (0=不透明)
+   set edge_strength, <f>        エッジ強調 (0=オフ, 1=デフォルト)
+   set roughness, <0-1>          PBR 粗さ (0=鏡面, 1=完全拡散)
+   set metallic, <0-1>           PBR 金属度
+   set ibl_intensity, <f>        環境光 (IBL) 強度 (0=オフ, 1=デフォルト)
+   set shadow_strength, <0-1>    影の強さ (0=なし, 1=最大)  [shadow]
+   set bloom_threshold, <f>      ブルーム閾値 (デフォルト=1.0, 低い→広範囲発光)
+   set bloom_intensity, <f>      ブルーム強度 (デフォルト=0.15)  [bloom]
+   set surface_color, <color> [, obj]   サーフェス色を固定
+   set cartoon_color, <color> [, obj]   リボン色を固定
+   set surface_color, default [, obj]   元の原子色に戻す
+
+ 背景
+   bg <color>                    背景色変更 (例: bg white / bg black)
+   background <color>            同上
+
+ その他
+   help / h / ?                  このヘルプを表示
+   quit / q / exit               終了
+─────────────────────────────────────────────────────────────────"
+        .to_string()
 }
 
 /// Build a human-readable chain + ligand summary for a freshly loaded structure.

@@ -41,6 +41,10 @@ pub struct MolecularObject {
     pub atom_rep_show: Vec<u8>,
     /// Per-atom display colors (RGB).
     pub atom_colors: Vec<[f32; 3]>,
+    /// If set, overrides all vertex colors for the surface representation.
+    pub surface_color_override: Option<[f32; 3]>,
+    /// If set, overrides all vertex colors for the ribbon representation.
+    pub ribbon_color_override: Option<[f32; 3]>,
 }
 
 impl MolecularObject {
@@ -79,6 +83,8 @@ impl MolecularObject {
             visible: true,
             atom_rep_show,
             atom_colors,
+            surface_color_override: None,
+            ribbon_color_override: None,
         }
     }
 
