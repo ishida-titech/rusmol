@@ -163,9 +163,20 @@ fn parse_set(rest: &str) -> Result<Command, String> {
             };
             Ok(Command::SetColor { rep, color, sel })
         }
+        "surface_type" => {
+            // Pass as a Set command with a sentinel value; the actual string
+            // is handled in app.rs. We encode: gaussian=0, ses=1.
+            let value = match val_str.to_lowercase().as_str() {
+                "gaussian" | "gauss" => 0.0,
+                "ses" | "connolly" | "molecular" => 1.0,
+                other => return Err(format!("set: unknown surface_type '{other}' (use gaussian or ses)")),
+            };
+            Ok(Command::Set { name, value })
+        }
         "transparency" | "surface_transparency" | "edge_strength" | "roughness" | "metallic"
         | "ibl_intensity" | "shadow_strength" | "shadow"
-        | "bloom_threshold" | "bloom_intensity" | "bloom" => {
+        | "bloom_threshold" | "bloom_intensity" | "bloom"
+        | "surface_quality" => {
             let value: f32 = val_str
                 .parse()
                 .map_err(|_| format!("set: '{val_str}' is not a number"))?;

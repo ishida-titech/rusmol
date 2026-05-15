@@ -1,15 +1,27 @@
 use crate::render::ribbon::RibbonVertex;
 use crate::scene::object::REP_SURFACE;
 use crate::structure::atom::Structure;
+use crate::util::color::vdw_radius;
 use glam::Vec3;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
 const SIGMA: f32 = 1.2;
 const THRESHOLD: f32 = 0.5;
-const STEP: f32 = 0.5;
 const MARGIN: f32 = 3.0;
 const CUTOFF: f32 = 5.0;
+
+/// Probe radius for SES (water molecule radius).
+const PROBE_RADIUS: f32 = 1.4;
+
+/// Surface computation method.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceType {
+    /// Gaussian density isosurface (default).
+    Gaussian,
+    /// Solvent-Excluded Surface via distance transform.
+    Ses,
+}
 
 // ── Marching Cubes lookup tables (Paul Bourke convention) ─────────────────────
 // Corner numbering: 0=(i,j,k), 1=(i+1,j,k), 2=(i+1,j+1,k), 3=(i,j+1,k),
@@ -326,65 +338,26 @@ const CORNER_OFF: [(i32,i32,i32); 8] = [
     (0,0,1),(1,0,1),(1,1,1),(0,1,1),
 ];
 
-/// Build an isosurface mesh from the molecular density field.
-/// Appends to the provided vertex and index buffers (same layout as ribbon).
-/// Water molecules (HOH/WAT/DOD) are excluded from the density computation.
-/// `residue_ids[i]` is the residue identifier for atom `i`.
-/// May take 1-5 seconds for large structures.
-pub fn build_surface(
-    structure: &Structure,
-    atom_colors: &[[f32; 3]],
-    residue_ids: &[u32],
-    atom_rep_show: &[u8],
-    vertices: &mut Vec<RibbonVertex>,
-    indices: &mut Vec<u32>,
+// ── Density field computation ─────────────────────────────────────────────────
+
+/// Fill density grid using Gaussian blobs (original method).
+/// atoms_data: (position, color, residue_id, vdw_radius)
+fn fill_density_gaussian(
+    atoms_data: &[(Vec3, [f32; 3], u32, f32)],
+    density: &mut [f32],
+    color_sum: &mut [[f32; 3]],
+    min: Vec3,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    step: f32,
 ) {
-    // ── 1. Collect atoms with REP_SURFACE bit set ──────────────────────────────
-    let atoms_data: Vec<(Vec3, [f32; 3], u32)> = structure
-        .atoms
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| atom_rep_show.get(*i).copied().unwrap_or(0) & REP_SURFACE != 0)
-        .map(|(i, a)| (a.position, atom_colors[i], residue_ids[i]))
-        .collect();
-
-    if atoms_data.is_empty() {
-        return;
-    }
-
-    // ── 2. Bounding box ────────────────────────────────────────────────────────
-    let mut min = Vec3::splat(f32::MAX);
-    let mut max = Vec3::splat(f32::MIN);
-    for (pos, _, _) in &atoms_data {
-        min = min.min(*pos);
-        max = max.max(*pos);
-    }
-    min -= Vec3::splat(MARGIN);
-    max += Vec3::splat(MARGIN);
-
-    // ── 3. Grid setup ──────────────────────────────────────────────────────────
-    // density[i][j][k] is defined at grid corner (min + [i,j,k] * STEP).
-    let nx = ((max.x - min.x) / STEP).ceil() as usize + 1;
-    let ny = ((max.y - min.y) / STEP).ceil() as usize + 1;
-    let nz = ((max.z - min.z) / STEP).ceil() as usize + 1;
-
-    // Safety cap: ~250 MB of data at most
-    if nx * ny * nz > 8_000_000 {
-        log::warn!("Surface grid too large ({nx}×{ny}×{nz}), skipping");
-        return;
-    }
-
-    let n = nx * ny * nz;
-    let mut density: Vec<f32> = vec![0.0; n];
-    let mut color_sum: Vec<[f32; 3]> = vec![[0.0; 3]; n];
-
-    // ── 4. Fill density grid ───────────────────────────────────────────────────
     let inv_2s2 = 1.0 / (2.0 * SIGMA * SIGMA);
     let cutoff2 = CUTOFF * CUTOFF;
-    let cells_r = (CUTOFF / STEP).ceil() as i32 + 1;
+    let cells_r = (CUTOFF / step).ceil() as i32 + 1;
 
-    for (pos, color, _) in &atoms_data {
-        let fc = (*pos - min) / STEP;
+    for (pos, color, _, _) in atoms_data {
+        let fc = (*pos - min) / step;
         let ci = fc.x as i32;
         let cj = fc.y as i32;
         let ck = fc.z as i32;
@@ -392,21 +365,21 @@ pub fn build_surface(
         for di in -cells_r..=cells_r {
             let ii = ci + di;
             if ii < 0 || ii >= nx as i32 { continue; }
-            let cx = min.x + (ii as f32) * STEP;
+            let cx = min.x + (ii as f32) * step;
             let dxf = cx - pos.x;
             if dxf * dxf > cutoff2 { continue; }
 
             for dj in -cells_r..=cells_r {
                 let jj = cj + dj;
                 if jj < 0 || jj >= ny as i32 { continue; }
-                let cy = min.y + (jj as f32) * STEP;
+                let cy = min.y + (jj as f32) * step;
                 let dyf = cy - pos.y;
                 if dxf * dxf + dyf * dyf > cutoff2 { continue; }
 
                 for dk in -cells_r..=cells_r {
                     let kk = ck + dk;
                     if kk < 0 || kk >= nz as i32 { continue; }
-                    let cz = min.z + (kk as f32) * STEP;
+                    let cz = min.z + (kk as f32) * step;
                     let dzf = cz - pos.z;
                     let r2 = dxf * dxf + dyf * dyf + dzf * dzf;
                     if r2 > cutoff2 { continue; }
@@ -421,19 +394,290 @@ pub fn build_surface(
             }
         }
     }
+}
 
-    // Normalize per-cell colors
-    let mut cell_color: Vec<[f32; 3]> = vec![[0.5, 0.5, 0.5]; n];
-    for i in 0..n {
-        if density[i] > 1e-6 {
-            let inv = 1.0 / density[i];
-            cell_color[i] = [
-                color_sum[i][0] * inv,
-                color_sum[i][1] * inv,
-                color_sum[i][2] * inv,
-            ];
+/// Compute 1D squared Euclidean distance transform in-place.
+/// Input: f[q] = 0.0 if in set, large value otherwise.
+/// Output: f[q] = min_p( (q - p)^2 + f_input[p] ), i.e. squared distance in grid units
+/// to the nearest set point (Felzenszwalb & Huttenlocher, 2012).
+fn edt_1d(f: &mut [f32]) {
+    let n = f.len();
+    if n <= 1 { return; }
+
+    let mut v = vec![0usize; n];   // parabola locations
+    let mut z = vec![0.0f32; n + 1]; // boundaries
+    let mut d = vec![0.0f32; n];
+
+    let mut k: usize = 0;
+    v[0] = 0;
+    z[0] = f32::NEG_INFINITY;
+    z[1] = f32::INFINITY;
+
+    for q in 1..n {
+        loop {
+            let vk = v[k];
+            let s = ((f[q] + (q * q) as f32) - (f[vk] + (vk * vk) as f32))
+                / (2 * q - 2 * vk) as f32;
+            if k > 0 && s <= z[k] {
+                k -= 1;
+            } else {
+                k += 1;
+                v[k] = q;
+                z[k] = s;
+                z[k + 1] = f32::INFINITY;
+                break;
+            }
         }
     }
+
+    k = 0;
+    for q in 0..n {
+        while z[k + 1] < q as f32 {
+            k += 1;
+        }
+        let dq = q as f32 - v[k] as f32;
+        d[q] = dq * dq + f[v[k]];
+    }
+    f[..n].copy_from_slice(&d);
+}
+
+/// 3D squared Euclidean Distance Transform (separable, O(n)).
+/// Each pass is parallelised over independent scanlines using rayon.
+fn edt_3d(grid: &mut [f32], nx: usize, ny: usize, nz: usize) {
+    // Pass 1: along z — each (i,j) row is independent and contiguous
+    grid.par_chunks_mut(nz).for_each(|row| {
+        edt_1d(row);
+    });
+
+    // Pass 2: along y — each (i, k) column is independent (stride = nz)
+    // Process per i-slab in parallel; within each slab iterate over k sequentially.
+    let slab = ny * nz;
+    grid.par_chunks_mut(slab).for_each(|plane| {
+        let mut buf = vec![0.0f32; ny];
+        for k in 0..nz {
+            for j in 0..ny {
+                buf[j] = plane[j * nz + k];
+            }
+            edt_1d(&mut buf);
+            for j in 0..ny {
+                plane[j * nz + k] = buf[j];
+            }
+        }
+    });
+
+    // Pass 3: along x — each (j, k) column is independent (stride = ny*nz)
+    // Transpose the grid into x-major order, apply EDT per column, transpose back.
+    let slab = ny * nz;
+    let mut transposed = vec![0.0f32; nx * ny * nz];
+    // grid[i*slab + j*nz + k] → transposed[(j*nz + k)*nx + i]
+    for i in 0..nx {
+        for jk in 0..slab {
+            transposed[jk * nx + i] = grid[i * slab + jk];
+        }
+    }
+    // Each row of transposed (length nx) is an independent x-column
+    transposed.par_chunks_mut(nx).for_each(|row| {
+        edt_1d(row);
+    });
+    // Transpose back
+    for i in 0..nx {
+        for jk in 0..slab {
+            grid[i * slab + jk] = transposed[jk * nx + i];
+        }
+    }
+}
+
+/// Fill density grid for Solvent-Excluded Surface via EDT.
+///
+/// Algorithm (correct SES, not SAS):
+/// 1. Compute signed distance to nearest VdW surface for each grid point.
+/// 2. Mark "accessible" region (probe center can sit here): d_vdw >= r_probe.
+/// 3. 3D EDT: squared distance from each point to nearest accessible point.
+/// 4. SES isosurface: d_to_accessible == r_probe.
+///    Points where d_to_accessible >= r_probe are INSIDE the SES.
+fn fill_density_ses(
+    atoms_data: &[(Vec3, [f32; 3], u32, f32)],
+    density: &mut [f32],
+    color_sum: &mut [[f32; 3]],
+    min: Vec3,
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    step: f32,
+) {
+    let n = nx * ny * nz;
+
+    // ── Step 1: min distance to VdW surface + closest atom ──────────────────
+    // Parallelise over i-slabs; each slab owns its own slice of the arrays.
+    let slab = ny * nz;
+    let mut min_vdw_dist = vec![f32::MAX; n];
+    let mut closest_atom = vec![0usize; n];
+
+    min_vdw_dist
+        .par_chunks_mut(slab)
+        .zip(closest_atom.par_chunks_mut(slab))
+        .enumerate()
+        .for_each(|(ii, (dist_slab, atom_slab))| {
+            let cx_base = min.x + (ii as f32) * step;
+            for (atom_idx, (pos, _, _, vdw_r)) in atoms_data.iter().enumerate() {
+                let max_r = vdw_r + PROBE_RADIUS + 2.0;
+                let dxf = cx_base - pos.x;
+                if dxf.abs() > max_r { continue; }
+
+                let cells_r = (max_r / step).ceil() as i32 + 1;
+                let fc = (*pos - min) / step;
+                let cj_center = fc.y as i32;
+                let ck_center = fc.z as i32;
+
+                for dj in -cells_r..=cells_r {
+                    let jj = cj_center + dj;
+                    if jj < 0 || jj >= ny as i32 { continue; }
+                    let cy = min.y + (jj as f32) * step;
+                    let dyf = cy - pos.y;
+                    if dxf * dxf + dyf * dyf > max_r * max_r { continue; }
+
+                    for dk in -cells_r..=cells_r {
+                        let kk = ck_center + dk;
+                        if kk < 0 || kk >= nz as i32 { continue; }
+                        let cz = min.z + (kk as f32) * step;
+                        let dzf = cz - pos.z;
+                        let r = (dxf * dxf + dyf * dyf + dzf * dzf).sqrt();
+                        let dist = r - vdw_r;
+
+                        let local_idx = (jj as usize) * nz + (kk as usize);
+                        if dist < dist_slab[local_idx] {
+                            dist_slab[local_idx] = dist;
+                            atom_slab[local_idx] = atom_idx;
+                        }
+                    }
+                }
+            }
+        });
+
+    // ── Step 2: Binary accessibility → EDT input ────────────────────────────
+    // Accessible = probe center can sit here (d_vdw >= r_probe).
+    // Points far from all atoms (min_vdw_dist = MAX) are also accessible.
+    let big = (nx * nx + ny * ny + nz * nz) as f32 + 1.0;
+    let mut dist_sq: Vec<f32> = min_vdw_dist
+        .par_iter()
+        .map(|&d| if d >= PROBE_RADIUS { 0.0 } else { big })
+        .collect();
+    drop(min_vdw_dist); // no longer needed, free memory before EDT
+
+    // ── Step 3: 3D EDT → squared distance to nearest accessible point ───────
+    edt_3d(&mut dist_sq, nx, ny, nz);
+
+    // ── Step 4: Convert to density for Marching Cubes ───────────────────────
+    // d_to_accessible = sqrt(dist_sq) * step  (in Å)
+    // Inside SES:  d_to_accessible >= PROBE_RADIUS
+    // SES surface: d_to_accessible == PROBE_RADIUS
+    // density = (d_to_accessible - PROBE_RADIUS) + THRESHOLD
+    //         = THRESHOLD on the surface, > THRESHOLD inside, < THRESHOLD outside
+    density
+        .par_iter_mut()
+        .zip(color_sum.par_iter_mut())
+        .zip(dist_sq.par_iter().zip(closest_atom.par_iter()))
+        .for_each(|((den, col), (&dsq, &aidx))| {
+            let d_ang = dsq.sqrt() * step;
+            let val = (d_ang - PROBE_RADIUS) + THRESHOLD;
+            if val > 0.0 {
+                *den = val;
+                let (_, color, _, _) = atoms_data[aidx];
+                *col = [color[0] * val, color[1] * val, color[2] * val];
+            }
+        });
+}
+
+/// Build an isosurface mesh from the molecular density field.
+/// Appends to the provided vertex and index buffers (same layout as ribbon).
+/// Water molecules (HOH/WAT/DOD) are excluded from the density computation.
+/// `residue_ids[i]` is the residue identifier for atom `i`.
+/// May take 1-5 seconds for large structures.
+pub fn build_surface(
+    structure: &Structure,
+    atom_colors: &[[f32; 3]],
+    residue_ids: &[u32],
+    atom_rep_show: &[u8],
+    surface_type: SurfaceType,
+    step: f32,
+    vertices: &mut Vec<RibbonVertex>,
+    indices: &mut Vec<u32>,
+) {
+    // ── 1. Collect atoms with REP_SURFACE bit set ──────────────────────────────
+    let atoms_data: Vec<(Vec3, [f32; 3], u32, f32)> = structure
+        .atoms
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| atom_rep_show.get(*i).copied().unwrap_or(0) & REP_SURFACE != 0)
+        .map(|(i, a)| {
+            let r = vdw_radius(&a.element);
+            (a.position, atom_colors[i], residue_ids[i], r)
+        })
+        .collect();
+
+    if atoms_data.is_empty() {
+        return;
+    }
+
+    // Max VdW radius for bounding box margin
+    let max_vdw = atoms_data.iter().map(|a| a.3).fold(0.0f32, f32::max);
+    let margin = match surface_type {
+        SurfaceType::Gaussian => MARGIN,
+        SurfaceType::Ses => max_vdw + PROBE_RADIUS + 1.0,
+    };
+
+    // ── 2. Bounding box ────────────────────────────────────────────────────────
+    let mut min = Vec3::splat(f32::MAX);
+    let mut max = Vec3::splat(f32::MIN);
+    for (pos, _, _, _) in &atoms_data {
+        min = min.min(*pos);
+        max = max.max(*pos);
+    }
+    min -= Vec3::splat(margin);
+    max += Vec3::splat(margin);
+
+    // ── 3. Grid setup ──────────────────────────────────────────────────────────
+    let nx = ((max.x - min.x) / step).ceil() as usize + 1;
+    let ny = ((max.y - min.y) / step).ceil() as usize + 1;
+    let nz = ((max.z - min.z) / step).ceil() as usize + 1;
+
+    let n_cells = nx * ny * nz;
+    if n_cells > 64_000_000 {
+        // ~28-32 B/cell → 64M≈2GB, 128M≈4GB, 256M≈8GB
+        log::warn!(
+            "Surface grid {nx}×{ny}×{nz} = {}M cells (~{} MB peak)",
+            n_cells / 1_000_000,
+            n_cells / 1_000_000 * 32,
+        );
+    }
+
+    let n = nx * ny * nz;
+    let mut density: Vec<f32> = vec![0.0; n];
+    let mut color_sum: Vec<[f32; 3]> = vec![[0.0; 3]; n];
+
+    match surface_type {
+        SurfaceType::Gaussian => {
+            fill_density_gaussian(&atoms_data, &mut density, &mut color_sum, min, nx, ny, nz, step);
+        }
+        SurfaceType::Ses => {
+            fill_density_ses(&atoms_data, &mut density, &mut color_sum, min, nx, ny, nz, step);
+        }
+    }
+
+    // Normalize per-cell colors
+    let cell_color: Vec<[f32; 3]> = density
+        .par_iter()
+        .zip(color_sum.par_iter())
+        .map(|(&d, c)| {
+            if d > 1e-6 {
+                let inv = 1.0 / d;
+                [c[0] * inv, c[1] * inv, c[2] * inv]
+            } else {
+                [0.5, 0.5, 0.5]
+            }
+        })
+        .collect();
+    drop(color_sum); // free memory before MC
 
     // ── 5. Marching Cubes (parallelised over the ci dimension) ────────────────
     // density and cell_color are read-only from here on; share via references.
@@ -509,14 +753,14 @@ pub fn build_surface(
                         let k1 = ck as i32 + dk1;
 
                         let p0 = Vec3::new(
-                            min.x + (i0 as f32) * STEP,
-                            min.y + (j0 as f32) * STEP,
-                            min.z + (k0 as f32) * STEP,
+                            min.x + (i0 as f32) * step,
+                            min.y + (j0 as f32) * step,
+                            min.z + (k0 as f32) * step,
                         );
                         let p1 = Vec3::new(
-                            min.x + (i1 as f32) * STEP,
-                            min.y + (j1 as f32) * STEP,
-                            min.z + (k1 as f32) * STEP,
+                            min.x + (i1 as f32) * step,
+                            min.y + (j1 as f32) * step,
+                            min.z + (k1 as f32) * step,
                         );
                         let position = p0.lerp(p1, t).to_array();
 
@@ -717,7 +961,7 @@ pub fn build_surface(
     // the nearest atom for each vertex. O(A) build + O(V × ~27) query.
     const CELL: f32 = 3.0;
     let mut spatial_hash: HashMap<(i32, i32, i32), Vec<usize>> = HashMap::new();
-    for (idx, (pos, _, _)) in atoms_data.iter().enumerate() {
+    for (idx, (pos, _, _, _)) in atoms_data.iter().enumerate() {
         let key = (
             (pos.x / CELL).floor() as i32,
             (pos.y / CELL).floor() as i32,
@@ -726,7 +970,7 @@ pub fn build_surface(
         spatial_hash.entry(key).or_default().push(idx);
     }
 
-    for v in &mut vertices[vert_start..] {
+    vertices[vert_start..].par_iter_mut().for_each(|v| {
         let p = Vec3::from(v.position);
         let cx = (p.x / CELL).floor() as i32;
         let cy = (p.y / CELL).floor() as i32;
@@ -751,6 +995,6 @@ pub fn build_surface(
             }
         }
         v.residue_id = best_resid;
-    }
+    });
 }
 

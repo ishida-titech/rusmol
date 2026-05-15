@@ -57,22 +57,25 @@ fn main() -> anyhow::Result<()> {
         .map(String::from)
         .collect();
 
+    log::info!("starting event loop");
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Wait);
+    let proxy = event_loop.create_proxy();
+
     // Spawn prompt thread (only when stdin is a tty and no -c-only mode)
     let (cmd_rx, resp_tx) = {
         use crossbeam_channel::unbounded;
         let (cmd_tx, cmd_rx)   = unbounded::<command::Command>();
         let (resp_tx, resp_rx) = unbounded::<command::CommandResponse>();
 
+        let prompt_proxy = proxy.clone();
         std::thread::spawn(move || {
-            command::prompt::run_prompt(cmd_tx, resp_rx);
+            command::prompt::run_prompt(cmd_tx, resp_rx, prompt_proxy);
         });
 
         (Some(cmd_rx), Some(resp_tx))
     };
 
-    log::info!("starting event loop");
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Wait);
     let mut app = app::App::new(scene, cmd_rx, resp_tx, initial_commands);
     event_loop.run_app(&mut app)?;
 

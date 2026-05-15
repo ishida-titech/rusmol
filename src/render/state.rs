@@ -185,6 +185,10 @@ pub struct RenderState {
     pub bloom_threshold: f32,
     /// Bloom intensity multiplier. Default 0.15. Set via `set bloom_intensity`.
     pub bloom_intensity: f32,
+    /// Surface computation method (Gaussian or SES). Default Gaussian.
+    pub surface_type: crate::render::surface::SurfaceType,
+    /// Surface grid step size in Å (default 0.5, smaller = finer mesh). Set via `set surface_quality`.
+    pub surface_quality: f32,
 
     // ── Shadow mapping ───────────────────────────────────────────────────────
     shadow_map_view: wgpu::TextureView,
@@ -1258,6 +1262,8 @@ impl RenderState {
             shadow_strength: 0.4,
             bloom_threshold: 1.0,
             bloom_intensity: 0.0,
+            surface_type: crate::render::surface::SurfaceType::Gaussian,
+            surface_quality: 0.5,
             shadow_map_view,
             shadow_uniform_buffer,
             shadow_uniform_bg,
@@ -1423,7 +1429,7 @@ impl RenderState {
                 let t0 = std::time::Instant::now();
                 let rids = self.residue_ids_cache.get(obj_name).map(|v| v.as_slice()).unwrap_or(&[]);
                 let verts_start = surface_verts.len();
-                build_surface(&obj.structure, &obj.atom_colors, rids, &obj.atom_rep_show, &mut surface_verts, &mut surface_idxs);
+                build_surface(&obj.structure, &obj.atom_colors, rids, &obj.atom_rep_show, self.surface_type, self.surface_quality, &mut surface_verts, &mut surface_idxs);
                 if let Some(col) = obj.surface_color_override {
                     for v in &mut surface_verts[verts_start..] {
                         v.color = col;

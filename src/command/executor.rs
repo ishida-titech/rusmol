@@ -346,6 +346,8 @@ fn help_text() -> String {
    set shadow_strength, <0-1>    影の強さ (0=なし, 1=最大)  [shadow]
    set bloom_threshold, <f>      ブルーム閾値 (デフォルト=1.0, 低い→広範囲発光)
    set bloom_intensity, <f>      ブルーム強度 (デフォルト=0.15)  [bloom]
+   set surface_type, <type>     表面計算方式 (gaussian / ses)
+   set surface_quality, <0.2-2> グリッド解像度 Å (小さい=高品質, デフォルト=0.5)
    set surface_color, <color> [, obj]   サーフェス色を固定
    set cartoon_color, <color> [, obj]   リボン色を固定
    set surface_color, default [, obj]   元の原子色に戻す

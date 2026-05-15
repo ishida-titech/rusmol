@@ -1,12 +1,13 @@
 use crossbeam_channel::{Receiver, Sender};
 use rustyline::error::ReadlineError;
+use winit::event_loop::EventLoopProxy;
 
 use super::parser::parse_command;
 use super::{Command, CommandResponse};
 
 /// Run the interactive prompt loop on a worker thread.
 /// Blocks until EOF, Ctrl-C, or the main thread drops the channel.
-pub fn run_prompt(cmd_tx: Sender<Command>, resp_rx: Receiver<CommandResponse>) {
+pub fn run_prompt(cmd_tx: Sender<Command>, resp_rx: Receiver<CommandResponse>, proxy: EventLoopProxy<()>) {
     let mut rl = match rustyline::DefaultEditor::new() {
         Ok(r) => r,
         Err(e) => {
@@ -30,6 +31,7 @@ pub fn run_prompt(cmd_tx: Sender<Command>, resp_rx: Receiver<CommandResponse>) {
                         if cmd_tx.send(cmd).is_err() {
                             break; // main thread gone
                         }
+                        let _ = proxy.send_event(());
                         // Wait for response from main thread
                         match resp_rx.recv() {
                             Ok(CommandResponse::Ok(msg)) => {
@@ -51,6 +53,7 @@ pub fn run_prompt(cmd_tx: Sender<Command>, resp_rx: Receiver<CommandResponse>) {
             }
             Err(ReadlineError::Interrupted | ReadlineError::Eof) => {
                 let _ = cmd_tx.send(Command::Quit);
+                let _ = proxy.send_event(());
                 break;
             }
             Err(e) => {

@@ -129,11 +129,25 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
-        // Forward every event to egui first; remember if it was consumed.
-        let egui_consumed = if let (Some(egui_state), AppState::Running { window, .. }) =
+        // Forward every event to egui first.
+        if let (Some(egui_state), AppState::Running { window, .. }) =
             (&mut self.egui_winit, &mut self.state)
         {
-            egui_state.on_window_event(&**window, &event).consumed
+            let _ = egui_state.on_window_event(&**window, &event);
+        }
+        // Determine if the pointer is over the egui toolbar by checking the
+        // physical Y coordinate against the window height.  Both
+        // on_window_event().consumed and is_pointer_over_area() are unreliable
+        // in release builds (egui consumes all events regardless of pointer
+        // position), so we use a direct geometric check.
+        let egui_consumed = if let AppState::Running { window, .. } = &self.state {
+            const TOOLBAR_LOGICAL_HEIGHT: f32 = 48.0;
+            let scale = window.scale_factor() as f32;
+            let win_h = window.inner_size().height as f32;
+            let toolbar_px = TOOLBAR_LOGICAL_HEIGHT * scale;
+            self.last_mouse_pos
+                .map(|p| p.y > win_h - toolbar_px)
+                .unwrap_or(false)
         } else {
             false
         };
@@ -344,7 +358,15 @@ impl ApplicationHandler for App {
                 }
             }
 
-            _ => {}
+            _ => {
+                // When pointer events land on the egui toolbar, we still need a
+                // redraw so that egui_ctx.run() can process the interaction.
+                if egui_consumed {
+                    if let AppState::Running { window, .. } = &self.state {
+                        window.request_redraw();
+                    }
+                }
+            }
         }
     }
 
@@ -379,6 +401,7 @@ impl ApplicationHandler for App {
                 }
 
                 if let Command::Set { ref name, value } = cmd {
+                    let mut need_rebuild = false;
                     if let AppState::Running { render, window, .. } = &mut self.state {
                         match name.as_str() {
                             "transparency" | "surface_transparency" => {
@@ -405,9 +428,27 @@ impl ApplicationHandler for App {
                             "bloom_intensity" | "bloom" => {
                                 render.bloom_intensity = value.max(0.0);
                             }
+                            "surface_type" => {
+                                use crate::render::surface::SurfaceType;
+                                let new_type = if value < 0.5 { SurfaceType::Gaussian } else { SurfaceType::Ses };
+                                if render.surface_type != new_type {
+                                    render.surface_type = new_type;
+                                    need_rebuild = true;
+                                }
+                            }
+                            "surface_quality" => {
+                                let new_q = value.clamp(0.2, 2.0);
+                                if (render.surface_quality - new_q).abs() > 0.01 {
+                                    render.surface_quality = new_q;
+                                    need_rebuild = true;
+                                }
+                            }
                             _ => {}
                         }
                         window.request_redraw();
+                    }
+                    if need_rebuild {
+                        self.scene_dirty = true;
                     }
                     if let Some(tx) = &self.resp_tx {
                         let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
@@ -439,8 +480,9 @@ impl ApplicationHandler for App {
 
         // Re-upload scene if modified (must happen before quit so surface is built)
         if self.scene_dirty {
-            if let AppState::Running { render, .. } = &mut self.state {
+            if let AppState::Running { render, window, .. } = &mut self.state {
                 render.upload_scene(&self.scene);
+                window.request_redraw();
             }
             self.scene_dirty = false;
         }
@@ -450,9 +492,6 @@ impl ApplicationHandler for App {
             return;
         }
 
-        if let AppState::Running { window, .. } = &self.state {
-            window.request_redraw();
-        }
     }
 }
 
@@ -528,6 +567,7 @@ impl App {
                     return;
                 }
                 if let Command::Set { ref name, value } = cmd {
+                    let mut need_rebuild = false;
                     if let AppState::Running { render, .. } = &mut self.state {
                         match name.as_str() {
                             "transparency" | "surface_transparency" => {
@@ -554,8 +594,26 @@ impl App {
                             "bloom_intensity" | "bloom" => {
                                 render.bloom_intensity = value.max(0.0);
                             }
+                            "surface_type" => {
+                                use crate::render::surface::SurfaceType;
+                                let new_type = if value < 0.5 { SurfaceType::Gaussian } else { SurfaceType::Ses };
+                                if render.surface_type != new_type {
+                                    render.surface_type = new_type;
+                                    need_rebuild = true;
+                                }
+                            }
+                            "surface_quality" => {
+                                let new_q = value.clamp(0.2, 2.0);
+                                if (render.surface_quality - new_q).abs() > 0.01 {
+                                    render.surface_quality = new_q;
+                                    need_rebuild = true;
+                                }
+                            }
                             _ => {}
                         }
+                    }
+                    if need_rebuild {
+                        self.scene_dirty = true;
                     }
                     return;
                 }
