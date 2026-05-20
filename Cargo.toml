@@ -28,3 +28,4 @@ egui-winit = "0.31"
 opt-level = 3
 lto = true
 strip = true
+codegen-units = 8

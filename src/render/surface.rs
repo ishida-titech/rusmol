@@ -603,18 +603,41 @@ pub fn build_surface(
     vertices: &mut Vec<RibbonVertex>,
     indices: &mut Vec<u32>,
 ) {
-    // ── 1. Collect atoms with REP_SURFACE bit set ──────────────────────────────
-    let atoms_data: Vec<(Vec3, [f32; 3], u32, f32)> = structure
-        .atoms
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| atom_rep_show.get(*i).copied().unwrap_or(0) & REP_SURFACE != 0)
-        .map(|(i, a)| {
-            let r = vdw_radius(&a.element);
-            (a.position, atom_colors[i], residue_ids[i], r)
-        })
-        .collect();
+    // ── 1. Collect atoms with REP_SURFACE bit set, grouped by chain ────────────
+    let mut chain_atoms: HashMap<char, Vec<(Vec3, [f32; 3], u32, f32)>> = HashMap::new();
+    for (i, a) in structure.atoms.iter().enumerate() {
+        if atom_rep_show.get(i).copied().unwrap_or(0) & REP_SURFACE == 0 {
+            continue;
+        }
+        let r = vdw_radius(&a.element);
+        chain_atoms
+            .entry(a.residue.chain)
+            .or_default()
+            .push((a.position, atom_colors[i], residue_ids[i], r));
+    }
 
+    if chain_atoms.is_empty() {
+        return;
+    }
+
+    // Sort chains for deterministic output order
+    let mut chains: Vec<char> = chain_atoms.keys().copied().collect();
+    chains.sort();
+
+    for chain_id in chains {
+        let atoms_data = &chain_atoms[&chain_id];
+        build_surface_for_atoms(atoms_data, surface_type, step, vertices, indices);
+    }
+}
+
+/// Build the surface mesh for a single group of atoms (typically one chain).
+fn build_surface_for_atoms(
+    atoms_data: &[(Vec3, [f32; 3], u32, f32)],
+    surface_type: SurfaceType,
+    step: f32,
+    vertices: &mut Vec<RibbonVertex>,
+    indices: &mut Vec<u32>,
+) {
     if atoms_data.is_empty() {
         return;
     }
@@ -629,7 +652,7 @@ pub fn build_surface(
     // ── 2. Bounding box ────────────────────────────────────────────────────────
     let mut min = Vec3::splat(f32::MAX);
     let mut max = Vec3::splat(f32::MIN);
-    for (pos, _, _, _) in &atoms_data {
+    for (pos, _, _, _) in atoms_data {
         min = min.min(*pos);
         max = max.max(*pos);
     }

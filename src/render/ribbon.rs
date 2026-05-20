@@ -265,33 +265,60 @@ fn build_segment(
 
     let m = spos.len();
 
-    // ── Pass 2: interpolated O-direction for every spline point ────────────
-    // For helix regions we need the cross-section to gradually rotate with
-    // the winding.  Pre-compute a smoothly interpolated O direction at every
-    // spline point by slerp-ing between neighbouring Cα O vectors.
-    let mut s_o_interp: Vec<Vec3> = Vec::with_capacity(m);
-    for seg in 0..n - 1 {
-        let steps = if seg == n - 2 { N_SUB + 1 } else { N_SUB };
-        for k in 0..steps {
-            let t = k as f32 / N_SUB as f32;
-            let a = o_dir[seg];
-            let b = o_dir[seg + 1];
-            // Slerp (with sign correction for consistency)
-            let b_c = if b.dot(a) >= 0.0 { b } else { -b };
-            let interp = (a * (1.0 - t) + b_c * t).normalize_or_zero();
-            s_o_interp.push(if interp.length_squared() > 0.5 { interp } else { a });
+    // ── Pass 2: compute local helix axis at each spline point ────────────
+    // For helix regions, the cross-section wide axis should point radially
+    // outward from the helix axis.  We compute a local axis per spline point
+    // using a sliding window of Cα positions, then derive the radial direction.
+    let helix_radial = compute_helix_radial(&spos, &sss, &stan, m);
+
+    // ── Helix boundary taper factor ──────────────────────────────────────
+    // Compute a [0,1] factor for each spline point: 0 at helix boundaries,
+    // 1 at interior.  Used to taper radial scaling and frame blending.
+    let helix_taper = {
+        let taper_len = N_SUB * 2; // fade over ~2 Cα intervals
+        let mut taper = vec![0.0f32; m];
+        let mut i = 0;
+        while i < m {
+            if sss[i] != SecondaryStructure::Helix { i += 1; continue; }
+            let run_start = i;
+            while i < m && sss[i] == SecondaryStructure::Helix { i += 1; }
+            let run_end = i;
+            let run_len = run_end - run_start;
+            for j in run_start..run_end {
+                let dist_start = j - run_start;
+                let dist_end = run_end - 1 - j;
+                let dist = dist_start.min(dist_end);
+                let t = if taper_len > 0 {
+                    (dist as f32 / taper_len as f32).min(1.0)
+                } else { 1.0 };
+                // Smoothstep for gentle transition
+                taper[j] = t * t * (3.0 - 2.0 * t);
+                // Also zero out taper if PCA window is too small (< 1 turn)
+                let min_window = N_SUB * 3; // ~3 residues
+                if dist_start < min_window / 2 && run_start == 0 { /* near segment start */ }
+                if run_len < min_window { taper[j] *= run_len as f32 / min_window as f32; }
+            }
+        }
+        taper
+    };
+
+    // ── Scale helix spiral radius outward (tapered at boundaries) ────────
+    {
+        let scale = 0.5; // max additional radial displacement in Å
+        for i in 0..m {
+            if let Some(r) = helix_radial[i] {
+                if sss[i] == SecondaryStructure::Helix {
+                    spos[i] += r * scale * helix_taper[i];
+                }
+            }
         }
     }
 
-    // ── Pass 3: side vector via Parallel Transport + gradual O correction ──
+    // ── Pass 3: side vector via Parallel Transport + radial correction ───
     //
     // Parallel transport gives a rotation-minimising frame (smooth, no jumps).
-    // For helix regions we blend toward the interpolated O direction at every
-    // spline point with a small weight, so the frame gradually tracks the
-    // helical winding without sudden jumps.
-    // For sheet interiors we skip correction entirely (flat cross-section is
-    // very sensitive to even tiny frame rotations).
-    // For coil / SS boundaries we snap fully at Cα positions.
+    // For helix interiors we use the radial binormal; at boundaries we blend
+    // between the parallel-transport frame and the helix frame using the taper.
     let mut sside: Vec<Vec3> = Vec::with_capacity(m);
     {
         let mut side = project_perp(o_dir[0], stan[0]).normalize_or_zero();
@@ -317,16 +344,16 @@ fn build_segment(
                 }
             }
 
-            // For helix points: gradual blend toward interpolated O direction.
-            // This makes the frame track the winding smoothly.
-            if ss == SecondaryStructure::Helix && i < s_o_interp.len() {
-                let o_target = project_perp(s_o_interp[i], stan[i]).normalize_or_zero();
-                if o_target.length_squared() > 0.5 {
-                    let o_t = if o_target.dot(side) >= 0.0 { o_target } else { -o_target };
-                    // Blend weight per spline step: small enough for smoothness,
-                    // large enough to track one full turn (~3.6 residues × N_SUB steps).
-                    let blend = 0.08;
-                    side = (side * (1.0 - blend) + o_t * blend).normalize();
+            // For helix points: blend between parallel-transport frame and
+            // helix radial binormal, using taper factor (0 at boundaries, 1 interior).
+            if ss == SecondaryStructure::Helix {
+                if let Some(radial) = helix_radial[i] {
+                    let binormal = stan[i].cross(radial).normalize_or_zero();
+                    if binormal.length_squared() > 0.5 {
+                        let target = if binormal.dot(side) >= 0.0 { binormal } else { -binormal };
+                        let t = helix_taper[i];
+                        side = (side * (1.0 - t) + target * t).normalize();
+                    }
                 }
             }
 
@@ -386,7 +413,14 @@ fn build_segment(
         let bnd: Vec<usize> = (1..m).filter(|&i| sss[i] != sss[i - 1]).collect();
 
         for (bi, &b) in bnd.iter().enumerate() {
-            let (a_l, b_l) = profile_dims(sss[b - 1]);
+            // If the left side ends with an arrow zone, use the arrow tip dims
+            // instead of the raw Sheet dims — otherwise the coil after the arrow
+            // tip suddenly bloats from 1.6 back to ~1.0 before settling to 0.22.
+            let (a_l, b_l) = if b > 0 && arrow_frac[b - 1] >= 0.0 {
+                arrow_profile_dims(prof_a[b - 1], prof_b[b - 1], arrow_frac[b - 1])
+            } else {
+                profile_dims(sss[b - 1])
+            };
             let (a_r, b_r) = profile_dims(sss[b]);
 
             // Clamp zone to midpoints between adjacent boundaries to prevent overlap
@@ -474,7 +508,7 @@ fn catmull_rom_deriv(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
 /// Cross-section semi-axes (width, thickness) in Ångströms.
 fn profile_dims(ss: SecondaryStructure) -> (f32, f32) {
     match ss {
-        SecondaryStructure::Helix    => (1.3, 0.45),  // wide ribbon, thin profile
+        SecondaryStructure::Helix    => (1.6, 0.30),  // wide ribbon, thin profile
         SecondaryStructure::Helix310 => (0.22, 0.22), // coil-like tube (colored as helix)
         SecondaryStructure::Sheet    => (1.6, 0.10),  // very flat ribbon → arrow contrast
         SecondaryStructure::Coil     => (0.22, 0.22),
@@ -515,5 +549,102 @@ fn lerp_color(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
         a[1] + (b[1] - a[1]) * t,
         a[2] + (b[2] - a[2]) * t,
     ]
+}
+
+// ── Helix radial direction ───────────────────────────────────────────────────
+
+/// Window radius (in spline points) for local helix axis estimation.
+const HELIX_AXIS_WINDOW: usize = 48; // ≈ 3 residues × 16 sub-steps
+
+/// For each spline point in a helix region, compute the radial direction
+/// (outward from the local helix axis).  Returns `None` for non-helix points.
+///
+/// Algorithm: for each helix spline point, take a window of nearby helix
+/// spline positions, fit a local axis via PCA (first principal component),
+/// then the radial direction = (point - axis_projection).normalize().
+fn compute_helix_radial(
+    spos: &[Vec3],
+    sss: &[SecondaryStructure],
+    _stan: &[Vec3],
+    m: usize,
+) -> Vec<Option<Vec3>> {
+    let mut radial: Vec<Option<Vec3>> = vec![None; m];
+
+    // Find contiguous helix runs in spline-point space.
+    let mut i = 0;
+    while i < m {
+        if sss[i] != SecondaryStructure::Helix {
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        while i < m && sss[i] == SecondaryStructure::Helix { i += 1; }
+        let run_end = i;
+        let run_len = run_end - run_start;
+        if run_len < 3 { continue; }
+
+        // For each point in the run, compute local axis from a window.
+        for j in run_start..run_end {
+            let half = HELIX_AXIS_WINDOW;
+            let lo = if j >= run_start + half { j - half } else { run_start };
+            let hi = (j + half + 1).min(run_end);
+            if hi - lo < 3 { continue; }
+
+            let axis = local_pca_axis(&spos[lo..hi]);
+            if axis.length_squared() < 0.5 { continue; }
+
+            // Centroid of the window
+            let n_pts = (hi - lo) as f32;
+            let centroid: Vec3 = spos[lo..hi].iter().copied().sum::<Vec3>() / n_pts;
+
+            // Project current point onto axis, radial = point - projection
+            let v = spos[j] - centroid;
+            let along = v.dot(axis);
+            let on_axis = centroid + axis * along;
+            let r = spos[j] - on_axis;
+            if r.length_squared() > 1e-6 {
+                radial[j] = Some(r.normalize());
+            }
+        }
+    }
+
+    radial
+}
+
+/// Compute the principal axis (first principal component) of a set of points
+/// using power iteration.
+fn local_pca_axis(pts: &[Vec3]) -> Vec3 {
+    let n = pts.len() as f32;
+    let centroid: Vec3 = pts.iter().copied().sum::<Vec3>() / n;
+
+    // Covariance matrix (symmetric 3×3)
+    let mut cov = [[0.0f32; 3]; 3];
+    for &p in pts {
+        let d = p - centroid;
+        let da = d.to_array();
+        for r in 0..3 {
+            for c in r..3 {
+                cov[r][c] += da[r] * da[c];
+            }
+        }
+    }
+    cov[1][0] = cov[0][1];
+    cov[2][0] = cov[0][2];
+    cov[2][1] = cov[1][2];
+
+    // Power iteration (10 steps)
+    let mut v = Vec3::new(1.0, 1.0, 1.0).normalize();
+    for _ in 0..10 {
+        let va = v.to_array();
+        let new = Vec3::new(
+            cov[0][0] * va[0] + cov[0][1] * va[1] + cov[0][2] * va[2],
+            cov[1][0] * va[0] + cov[1][1] * va[1] + cov[1][2] * va[2],
+            cov[2][0] * va[0] + cov[2][1] * va[1] + cov[2][2] * va[2],
+        );
+        let len = new.length();
+        if len < 1e-10 { break; }
+        v = new / len;
+    }
+    v
 }
 
