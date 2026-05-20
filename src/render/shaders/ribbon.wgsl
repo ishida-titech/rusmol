@@ -20,6 +20,11 @@ struct Uniforms {
     ground_color:      vec3<f32>,     // offset 240
     shadow_strength:   f32,           // offset 252
     light_view_proj:   mat4x4<f32>,  // offset 256
+    bloom_threshold:   f32,           // offset 320
+    bloom_intensity:   f32,           // offset 324
+    light2_dir_xy:     vec2<f32>,     // offset 328
+    light2_dir_z:      f32,           // offset 336
+    light2_intensity:  f32,           // offset 340
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -151,6 +156,12 @@ fn fs_main(in: VertOut, @builtin(front_facing) is_front: bool) -> @location(0) v
     let shadow = mix(1.0, shadow_factor(in.world_pos), u.shadow_strength);
     var color = shadow * pbr_direct(N, V, L, in.color, u.roughness, u.metallic, u.light_intensity)
              + pbr_ibl(N, V, in.color, u.roughness, u.metallic);
+
+    // Light 2
+    if u.light2_intensity > 0.0 {
+        let L2 = normalize(vec3<f32>(u.light2_dir_xy, u.light2_dir_z));
+        color += pbr_direct(N, V, L2, in.color, u.roughness, u.metallic, u.light2_intensity);
+    }
 
     // Fresnel edge darkening (cartoon silhouette)
     let nv        = max(dot(N, V), 0.0);

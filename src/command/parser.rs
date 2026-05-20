@@ -37,7 +37,12 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
             }
         }
         "light" => parse_light(rest),
+        "light2" => parse_light2(rest),
         "set"   => parse_set(rest),
+        "get"   => {
+            let name = rest.trim();
+            Ok(Command::Get { name: if name.is_empty() { None } else { Some(name.to_string()) } })
+        }
         "help" | "h" | "?" => Ok(Command::Help),
         "quit" | "q" | "exit" => Ok(Command::Quit),
         other => Err(format!("unknown command: '{other}'")),
@@ -176,7 +181,9 @@ fn parse_set(rest: &str) -> Result<Command, String> {
         "transparency" | "surface_transparency" | "edge_strength" | "roughness" | "metallic"
         | "ibl_intensity" | "shadow_strength" | "shadow"
         | "bloom_threshold" | "bloom_intensity" | "bloom"
-        | "surface_quality" => {
+        | "surface_quality"
+        | "light_intensity" | "light_elevation" | "light_azimuth"
+        | "light2_intensity" | "light2_elevation" | "light2_azimuth" => {
             let value: f32 = val_str
                 .parse()
                 .map_err(|_| format!("set: '{val_str}' is not a number"))?;
@@ -211,6 +218,32 @@ fn parse_light(rest: &str) -> Result<Command, String> {
         return Err("light: expected intensity, elevation, or azimuth".into());
     }
     Ok(Command::Light { intensity, elevation, azimuth })
+}
+
+/// Parse: `light2 [intensity <f>] [elevation <f>] [azimuth <f>]`
+fn parse_light2(rest: &str) -> Result<Command, String> {
+    let mut intensity: Option<f32> = None;
+    let mut elevation: Option<f32> = None;
+    let mut azimuth:   Option<f32> = None;
+
+    let mut tokens = rest.split_whitespace();
+    while let Some(key) = tokens.next() {
+        let val_str = tokens.next()
+            .ok_or_else(|| format!("light2: expected value after '{key}'"))?;
+        let val: f32 = val_str.parse()
+            .map_err(|_| format!("light2: '{val_str}' is not a number"))?;
+        match key.to_lowercase().as_str() {
+            "intensity" | "i" => intensity = Some(val.max(0.0)),
+            "elevation" | "el" => elevation = Some(val.clamp(-90.0, 90.0)),
+            "azimuth"   | "az" => azimuth   = Some(val),
+            other => return Err(format!("light2: unknown parameter '{other}'")),
+        }
+    }
+
+    if intensity.is_none() && elevation.is_none() && azimuth.is_none() {
+        return Err("light2: expected intensity, elevation, or azimuth".into());
+    }
+    Ok(Command::Light2 { intensity, elevation, azimuth })
 }
 
 fn named_color(s: &str) -> Option<[f32; 3]> {

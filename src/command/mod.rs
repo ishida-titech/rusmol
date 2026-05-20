@@ -39,12 +39,16 @@ pub enum Command {
     Background([f32; 3]),
     /// Adjust light source.  All fields are optional; omitted values are unchanged.
     Light { intensity: Option<f32>, elevation: Option<f32>, azimuth: Option<f32> },
+    /// Adjust second light source (PyMOL light2).
+    Light2 { intensity: Option<f32>, elevation: Option<f32>, azimuth: Option<f32> },
     /// PyMOL-compatible: `set name, value`
     /// Supported names: transparency, surface_transparency
     Set { name: String, value: f32 },
     /// PyMOL-compatible: `set surface_color|cartoon_color, color[, sel]`
     /// color=None means reset to per-atom colors ("default").
     SetColor { rep: String, color: Option<[f32; 3]>, sel: Option<String> },
+    /// `get [name]` — show current parameter value(s)
+    Get { name: Option<String> },
     Help,
     Quit,
 }

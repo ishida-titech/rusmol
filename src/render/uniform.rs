@@ -28,7 +28,11 @@ pub struct Uniforms {
     // ── Bloom ────────────────────────────────────────────────────────────────
     pub bloom_threshold:   f32,           // offset 320,  4 bytes
     pub bloom_intensity:   f32,           // offset 324,  4 bytes
-    pub _pad_bloom:        [f32; 2],      // offset 328,  8 bytes → total 336 bytes (aligned to 16)
+    // ── Light 2 ─────────────────────────────────────────────────────────────
+    pub light2_dir:        [f32; 2],      // offset 328,  8 bytes (xy; z is in next row)
+    pub light2_dir_z:      f32,           // offset 336,  4 bytes
+    pub light2_intensity:  f32,           // offset 340,  4 bytes
+    pub _pad_end:          [f32; 2],      // offset 344,  8 bytes → total 352 bytes (aligned to 16)
 }
 
 impl Uniforms {
@@ -54,6 +58,8 @@ impl Uniforms {
         light_view_proj: Mat4,
         bloom_threshold: f32,
         bloom_intensity: f32,
+        light2_dir: Vec3,
+        light2_intensity: f32,
     ) -> Self {
         Self {
             view_proj: view_proj.to_cols_array_2d(),
@@ -77,7 +83,10 @@ impl Uniforms {
             light_view_proj: light_view_proj.to_cols_array_2d(),
             bloom_threshold,
             bloom_intensity,
-            _pad_bloom: [0.0; 2],
+            light2_dir: [light2_dir.normalize().x, light2_dir.normalize().y],
+            light2_dir_z: light2_dir.normalize().z,
+            light2_intensity,
+            _pad_end: [0.0; 2],
         }
     }
 }

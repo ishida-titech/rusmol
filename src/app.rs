@@ -39,6 +39,8 @@ pub struct App {
     last_mouse_pos:  Option<Vec2>,
     left_pressed:    bool,
     right_pressed:   bool,
+    middle_pressed:  bool,
+    ctrl_pressed:    bool,
     /// Physical pixel position where left button was pressed (for click vs drag)
     mouse_press_pos: Option<Vec2>,
 
@@ -66,6 +68,8 @@ impl App {
             last_mouse_pos: None,
             left_pressed: false,
             right_pressed: false,
+            middle_pressed: false,
+            ctrl_pressed: false,
             mouse_press_pos: None,
             scene_dirty: false,
             egui_ctx:   egui::Context::default(),
@@ -172,6 +176,10 @@ impl ApplicationHandler for App {
                 window.request_redraw();
             }
 
+            WindowEvent::ModifiersChanged(mods) => {
+                self.ctrl_pressed = mods.state().control_key();
+            }
+
             WindowEvent::MouseInput { state, button, .. } if !egui_consumed => {
                 match button {
                     MouseButton::Left => {
@@ -204,6 +212,12 @@ impl ApplicationHandler for App {
                             self.last_mouse_pos = None;
                         }
                     }
+                    MouseButton::Middle => {
+                        self.middle_pressed = state == ElementState::Pressed;
+                        if state == ElementState::Released {
+                            self.last_mouse_pos = None;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -213,7 +227,17 @@ impl ApplicationHandler for App {
                 if !egui_consumed {
                     if let Some(last) = self.last_mouse_pos {
                         let delta = pos - last;
-                        if self.left_pressed {
+                        let light_drag = self.middle_pressed
+                            || (self.left_pressed && self.ctrl_pressed);
+                        if light_drag {
+                            // Ctrl+left-drag or middle-drag: move light direction
+                            let sensitivity = 0.5;
+                            render.light_azimuth_deg   += delta.x * sensitivity;
+                            render.light_elevation_deg =
+                                (render.light_elevation_deg - delta.y * sensitivity)
+                                    .clamp(-90.0, 90.0);
+                            window.request_redraw();
+                        } else if self.left_pressed {
                             camera.arcball_rotate(delta);
                             window.request_redraw();
                         } else if self.right_pressed {
@@ -286,6 +310,10 @@ impl ApplicationHandler for App {
                                 if ui.button("Neon Glow").clicked() {
                                     preset_action = Some(15);
                                 }
+                                ui.add_space(4.0);
+                                if ui.button("Dual Light").clicked() {
+                                    preset_action = Some(16);
+                                }
                             });
                         });
                 });
@@ -313,6 +341,7 @@ impl ApplicationHandler for App {
                         12 => Some(wgpu::Color { r: 0.22, g: 0.22, b: 0.22, a: 1.0 }), // dark gray
                         14 => Some(wgpu::Color { r: 0.05, g: 0.25, b: 0.70, a: 1.0 }), // vivid blue
                         15 => Some(wgpu::Color { r: 0.02, g: 0.02, b: 0.05, a: 1.0 }), // near-black
+                        16 => Some(wgpu::Color { r: 0.08, g: 0.08, b: 0.12, a: 1.0 }), // dark blue-gray
                         _  => None,
                     };
                     if let Some(c) = bg {
@@ -342,6 +371,25 @@ impl ApplicationHandler for App {
                             render.edge_strength = 1.0;
                         }
                     }
+                    // Light2 / light direction per preset
+                    match preset {
+                        16 => {
+                            // Dual Light: key light from right, fill from left — IBL reduced
+                            render.light_elevation_deg = 20.0;
+                            render.light_azimuth_deg = 90.0;
+                            render.light_intensity = 1.5;
+                            render.light2_elevation_deg = 10.0;
+                            render.light2_azimuth_deg = -90.0;
+                            render.light2_intensity = 0.8;
+                            render.ibl_intensity = 0.3;
+                        }
+                        _ => {
+                            // Reset to defaults
+                            render.light2_intensity = 0.0;
+                            render.light_elevation_deg = 30.0;
+                            render.light_azimuth_deg = 30.0;
+                        }
+                    }
                     match preset {
                         0  => apply_default_view(&mut self.scene),
                         1  => apply_chain_surface_view(&mut self.scene),
@@ -352,6 +400,7 @@ impl ApplicationHandler for App {
                         12 => apply_lines_view(&mut self.scene),
                         14 => apply_spectrum_view(&mut self.scene),
                         15 => apply_neon_glow_view(&mut self.scene),
+                        16 => apply_default_view(&mut self.scene),
                         _  => {}
                     }
                     self.scene_dirty = true;
@@ -443,12 +492,56 @@ impl ApplicationHandler for App {
                                     need_rebuild = true;
                                 }
                             }
+                            "light_intensity"  => render.light_intensity     = value.max(0.0),
+                            "light_elevation"  => render.light_elevation_deg = value.clamp(-90.0, 90.0),
+                            "light_azimuth"    => render.light_azimuth_deg   = value,
+                            "light2_intensity" => render.light2_intensity     = value.max(0.0),
+                            "light2_elevation" => render.light2_elevation_deg = value.clamp(-90.0, 90.0),
+                            "light2_azimuth"   => render.light2_azimuth_deg   = value,
                             _ => {}
                         }
                         window.request_redraw();
                     }
                     if need_rebuild {
                         self.scene_dirty = true;
+                    }
+                    if let Some(tx) = &self.resp_tx {
+                        let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
+                    }
+                    continue;
+                }
+
+                if let Command::Get { ref name } = cmd {
+                    let msg = if let AppState::Running { render, .. } = &self.state {
+                        format_get_params(render, name.as_deref())
+                    } else {
+                        "Not initialized".to_string()
+                    };
+                    if let Some(tx) = &self.resp_tx {
+                        let _ = tx.send(crate::command::CommandResponse::Ok(msg));
+                    }
+                    continue;
+                }
+
+                if let Command::Light { intensity, elevation, azimuth } = cmd {
+                    if let AppState::Running { render, window, .. } = &mut self.state {
+                        if let Some(v) = intensity { render.light_intensity     = v; }
+                        if let Some(v) = elevation { render.light_elevation_deg = v; }
+                        if let Some(v) = azimuth   { render.light_azimuth_deg   = v; }
+                        window.request_redraw();
+                    }
+                    if let Some(tx) = &self.resp_tx {
+                        let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
+                    }
+                    continue;
+                }
+
+                if let Command::Light2 { intensity, elevation, azimuth } = cmd {
+                    if let AppState::Running { render, window, .. } = &mut self.state {
+                        if let Some(v) = intensity { render.light2_intensity     = v; }
+                        if let Some(v) = elevation { render.light2_elevation_deg = v; }
+                        if let Some(v) = azimuth   { render.light2_azimuth_deg   = v; }
+                        window.request_redraw();
                     }
                     if let Some(tx) = &self.resp_tx {
                         let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
@@ -566,6 +659,15 @@ impl App {
                     }
                     return;
                 }
+                if let Command::Light2 { intensity, elevation, azimuth } = cmd {
+                    if let AppState::Running { render, window, .. } = &mut self.state {
+                        if let Some(v) = intensity { render.light2_intensity    = v; }
+                        if let Some(v) = elevation { render.light2_elevation_deg = v; }
+                        if let Some(v) = azimuth   { render.light2_azimuth_deg   = v; }
+                        window.request_redraw();
+                    }
+                    return;
+                }
                 if let Command::Set { ref name, value } = cmd {
                     let mut need_rebuild = false;
                     if let AppState::Running { render, .. } = &mut self.state {
@@ -609,6 +711,12 @@ impl App {
                                     need_rebuild = true;
                                 }
                             }
+                            "light_intensity"  => render.light_intensity     = value.max(0.0),
+                            "light_elevation"  => render.light_elevation_deg = value.clamp(-90.0, 90.0),
+                            "light_azimuth"    => render.light_azimuth_deg   = value,
+                            "light2_intensity" => render.light2_intensity     = value.max(0.0),
+                            "light2_elevation" => render.light2_elevation_deg = value.clamp(-90.0, 90.0),
+                            "light2_azimuth"   => render.light2_azimuth_deg   = value,
                             _ => {}
                         }
                     }
@@ -715,18 +823,52 @@ fn apply_chain_surface_view(scene: &mut Scene) {
 }
 
 /// Collect world-space positions of all ligand (non-water HETATM) atoms across the scene.
+/// Return the residue name of the largest ligand (most atoms), or None if no ligands.
+fn largest_ligand_resn(scene: &Scene) -> Option<String> {
+    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
+    let mut count_by_resn: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (_, obj) in scene.iter() {
+        for atom in &obj.structure.atoms {
+            if !atom.is_hetatm { continue; }
+            let resn = atom.residue.name.trim().to_string();
+            if WATERS.contains(&resn.as_str()) { continue; }
+            *count_by_resn.entry(resn).or_insert(0) += 1;
+        }
+    }
+    count_by_resn.into_iter().max_by_key(|(_, c)| *c).map(|(name, _)| name)
+}
+
+/// Collect positions of the largest ligand(s) in the scene.
+/// "Largest" = the residue name with the most atoms across all HETATM non-water
+/// residues. All instances of that residue name are included.
 fn collect_ligand_positions(scene: &Scene) -> Vec<glam::Vec3> {
     const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
+    // Count atoms per residue name
+    let mut count_by_resn: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (_, obj) in scene.iter() {
+        for atom in &obj.structure.atoms {
+            if !atom.is_hetatm { continue; }
+            let resn = atom.residue.name.trim().to_string();
+            if WATERS.contains(&resn.as_str()) { continue; }
+            *count_by_resn.entry(resn).or_insert(0) += 1;
+        }
+    }
+    let largest_resn = match count_by_resn.iter().max_by_key(|(_, &c)| c) {
+        Some((name, _)) => name.clone(),
+        None => return Vec::new(),
+    };
     let mut positions = Vec::new();
     for (_, obj) in scene.iter() {
         for atom in &obj.structure.atoms {
             if !atom.is_hetatm { continue; }
-            if WATERS.contains(&atom.residue.name.trim()) { continue; }
+            if atom.residue.name.trim() != largest_resn { continue; }
             positions.push(atom.position);
         }
     }
     positions
 }
+
+
 
 /// Check if an atom is within `cutoff` Å of any ligand position.
 fn is_near_ligand(pos: glam::Vec3, ligand_positions: &[glam::Vec3], cutoff: f32) -> bool {
@@ -764,6 +906,7 @@ fn apply_binding_site_view(scene: &mut Scene) {
     const DIM_GRAY: [f32; 3] = [0.75, 0.75, 0.75];
 
     let ligand_positions = collect_ligand_positions(scene);
+    let target_resn = largest_ligand_resn(scene);
 
     // Build chain → color index map (stable across objects)
     let mut chain_index: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
@@ -794,9 +937,13 @@ fn apply_binding_site_view(scene: &mut Scene) {
             if is_water {
                 obj.atom_rep_show[i] = 0;
                 obj.atom_colors[i] = cpk_color(&atom.element);
-            } else if !is_polymer {
-                // Ligand
+            } else if !is_polymer && target_resn.as_deref() == Some(atom.residue.name.trim()) {
+                // Target ligand
                 obj.atom_rep_show[i] = REP_BALL_STICK;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            } else if !is_polymer {
+                // Other ligands / ions — hide
+                obj.atom_rep_show[i] = 0;
                 obj.atom_colors[i] = cpk_color(&atom.element);
             } else if near.contains(&res_key) {
                 // Near-ligand protein residue
@@ -825,6 +972,7 @@ fn apply_pocket_surface_view(scene: &mut Scene) {
     const DIM_GRAY: [f32; 3] = [0.75, 0.75, 0.75];
 
     let ligand_positions = collect_ligand_positions(scene);
+    let target_resn = largest_ligand_resn(scene);
 
     let near_residues: std::collections::HashMap<String, std::collections::HashSet<(char, i32, Option<char>)>> =
         scene.iter().map(|(name, obj)| {
@@ -841,8 +989,11 @@ fn apply_pocket_surface_view(scene: &mut Scene) {
             if is_water {
                 obj.atom_rep_show[i] = 0;
                 obj.atom_colors[i] = cpk_color(&atom.element);
-            } else if !is_polymer {
+            } else if !is_polymer && target_resn.as_deref() == Some(atom.residue.name.trim()) {
                 obj.atom_rep_show[i] = REP_BALL_STICK;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            } else if !is_polymer {
+                obj.atom_rep_show[i] = 0;
                 obj.atom_colors[i] = cpk_color(&atom.element);
             } else if near.contains(&res_key) {
                 obj.atom_rep_show[i] = REP_SURFACE;
@@ -1109,4 +1260,52 @@ fn scene_bounds(scene: &Scene) -> (glam::Vec3, f32) {
     let centroid = sum / count as f32;
     let radius   = ((max - min).length() * 0.5).max(1.0);
     (centroid, radius)
+}
+
+/// Format parameter values for the `get` command.
+fn format_get_params(render: &RenderState, name: Option<&str>) -> String {
+    use crate::render::surface::SurfaceType;
+
+    let surface_type_str = match render.surface_type {
+        SurfaceType::Gaussian => "gaussian",
+        SurfaceType::Ses => "ses",
+    };
+
+    let params: &[(&str, String)] = &[
+        ("transparency",    format!("{:.2}", 1.0 - render.surface_alpha)),
+        ("surface_type",    surface_type_str.to_string()),
+        ("surface_quality", format!("{:.2}", render.surface_quality)),
+        ("edge_strength",   format!("{:.2}", render.edge_strength)),
+        ("roughness",       format!("{:.2}", render.roughness)),
+        ("metallic",        format!("{:.2}", render.metallic)),
+        ("ibl_intensity",   format!("{:.2}", render.ibl_intensity)),
+        ("shadow_strength", format!("{:.2}", render.shadow_strength)),
+        ("bloom_threshold", format!("{:.2}", render.bloom_threshold)),
+        ("bloom_intensity", format!("{:.2}", render.bloom_intensity)),
+        ("light_intensity",  format!("{:.2}", render.light_intensity)),
+        ("light_elevation",  format!("{:.1}", render.light_elevation_deg)),
+        ("light_azimuth",    format!("{:.1}", render.light_azimuth_deg)),
+        ("light2_intensity", format!("{:.2}", render.light2_intensity)),
+        ("light2_elevation", format!("{:.1}", render.light2_elevation_deg)),
+        ("light2_azimuth",   format!("{:.1}", render.light2_azimuth_deg)),
+    ];
+
+    match name {
+        None => {
+            // Show all
+            let max_name_len = params.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+            params
+                .iter()
+                .map(|(n, v)| format!("  {:width$} = {}", n, v, width = max_name_len))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        Some(query) => {
+            if let Some((_, v)) = params.iter().find(|(n, _)| *n == query) {
+                format!("{query} = {v}")
+            } else {
+                format!("unknown parameter: '{query}'")
+            }
+        }
+    }
 }

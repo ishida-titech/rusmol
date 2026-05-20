@@ -283,8 +283,10 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
 
         Command::Background(_) => (CommandResponse::Ok(String::new()), false),
         Command::Light { .. }  => (CommandResponse::Ok(String::new()), false),
+        Command::Light2 { .. } => (CommandResponse::Ok(String::new()), false),
         Command::Set { .. }    => (CommandResponse::Ok(String::new()), false),
         Command::SetColor { .. } => (CommandResponse::Ok(String::new()), false),
+        Command::Get { .. }   => (CommandResponse::Ok(String::new()), false),
         Command::Help => (CommandResponse::Ok(help_text()), false),
         Command::Quit => (CommandResponse::Ok("bye".into()), false),
     }
@@ -355,6 +357,10 @@ fn help_text() -> String {
  背景
    bg <color>                    背景色変更 (例: bg white / bg black)
    background <color>            同上
+
+ パラメータ確認
+   get                           全パラメータを一覧表示
+   get <name>                    指定パラメータの値を表示
 
  その他
    help / h / ?                  このヘルプを表示

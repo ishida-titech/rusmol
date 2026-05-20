@@ -159,12 +159,18 @@ pub struct RenderState {
 
     pub bg_color: wgpu::Color,
 
-    /// Light intensity multiplier (default 1.0).
+    /// Light 1 intensity multiplier (default 1.0).
     pub light_intensity: f32,
-    /// Light elevation angle in degrees above the horizontal (default 30.0).
+    /// Light 1 elevation angle in degrees above the horizontal (default 30.0).
     pub light_elevation_deg: f32,
-    /// Light azimuth angle in degrees clockwise from forward (default 20.0).
+    /// Light 1 azimuth angle in degrees clockwise from forward (default 20.0).
     pub light_azimuth_deg: f32,
+    /// Light 2 intensity multiplier (default 0.0 = off).
+    pub light2_intensity: f32,
+    /// Light 2 elevation angle in degrees (default -20.0).
+    pub light2_elevation_deg: f32,
+    /// Light 2 azimuth angle in degrees (default -160.0, roughly opposite to light 1).
+    pub light2_azimuth_deg: f32,
     /// Surface transparency alpha (default 0.65). Set via `set transparency`.
     pub surface_alpha: f32,
     /// Edge darkening strength (default 1.0, 0=off). Set via `set edge_strength`.
@@ -404,6 +410,8 @@ impl RenderState {
             glam::Mat4::IDENTITY,
             1.0,   // bloom_threshold
             0.0,   // bloom_intensity (off by default)
+            glam::Vec3::ZERO, // light2_dir
+            0.0,              // light2_intensity (off by default)
         );
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniforms"),
@@ -1252,6 +1260,9 @@ impl RenderState {
             light_intensity: 1.0,
             light_elevation_deg: 30.0,
             light_azimuth_deg: 20.0,
+            light2_intensity: 0.0,
+            light2_elevation_deg: -20.0,
+            light2_azimuth_deg: -160.0,
             surface_alpha: 1.0,
             edge_strength: 1.0,
             roughness: 0.4,
@@ -1262,7 +1273,7 @@ impl RenderState {
             shadow_strength: 0.4,
             bloom_threshold: 1.0,
             bloom_intensity: 0.0,
-            surface_type: crate::render::surface::SurfaceType::Gaussian,
+            surface_type: crate::render::surface::SurfaceType::Ses,
             surface_quality: 0.5,
             shadow_map_view,
             shadow_uniform_buffer,
@@ -1396,6 +1407,13 @@ impl RenderState {
                 let f1 = obj.atom_rep_show.get(a1).copied().unwrap_or(0);
                 let f2 = obj.atom_rep_show.get(a2).copied().unwrap_or(0);
                 if f1 & REP_BALL_STICK == 0 || f2 & REP_BALL_STICK == 0 { continue; }
+                // Skip cross-category bonds (e.g. CONECT between protein and ligand)
+                if atoms[a1].is_hetatm != atoms[a2].is_hetatm {
+                    let same_residue = atoms[a1].residue.chain == atoms[a2].residue.chain
+                        && atoms[a1].residue.seq_num == atoms[a2].residue.seq_num
+                        && atoms[a1].residue.ins_code == atoms[a2].residue.ins_code;
+                    if !same_residue { continue; }
+                }
                 let p1  = atoms[a1].position.to_array();
                 let p2  = atoms[a2].position.to_array();
                 let mid = [(p1[0]+p2[0])*0.5, (p1[1]+p2[1])*0.5, (p1[2]+p2[2])*0.5];
@@ -1493,6 +1511,13 @@ impl RenderState {
                 let f1 = obj.atom_rep_show.get(a1).copied().unwrap_or(0);
                 let f2 = obj.atom_rep_show.get(a2).copied().unwrap_or(0);
                 if f1 & REP_LINES == 0 || f2 & REP_LINES == 0 { continue; }
+                // Skip cross-category bonds (e.g. CONECT between protein and ligand)
+                if atoms[a1].is_hetatm != atoms[a2].is_hetatm {
+                    let same_residue = atoms[a1].residue.chain == atoms[a2].residue.chain
+                        && atoms[a1].residue.seq_num == atoms[a2].residue.seq_num
+                        && atoms[a1].residue.ins_code == atoms[a2].residue.ins_code;
+                    if !same_residue { continue; }
+                }
                 let p1  = atoms[a1].position.to_array();
                 let p2  = atoms[a2].position.to_array();
                 let mid = [(p1[0]+p2[0])*0.5, (p1[1]+p2[1])*0.5, (p1[2]+p2[2])*0.5];
@@ -1652,6 +1677,17 @@ impl RenderState {
             el.cos() * az.cos(),
         );
         let light_dir = camera.rotation * light_base;
+
+        // Light 2
+        let az2 = self.light2_azimuth_deg.to_radians();
+        let el2 = self.light2_elevation_deg.to_radians();
+        let light2_base = glam::Vec3::new(
+            el2.cos() * az2.sin(),
+            el2.sin(),
+            el2.cos() * az2.cos(),
+        );
+        let light2_dir = camera.rotation * light2_base;
+
         let screen_size = [self.config.width as f32, self.config.height as f32];
         let bg = [
             self.bg_color.r as f32,
@@ -1705,6 +1741,8 @@ impl RenderState {
             light_view_proj,
             self.bloom_threshold,
             self.bloom_intensity,
+            light2_dir,
+            self.light2_intensity,
         );
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
