@@ -209,18 +209,18 @@ fn build_segment(
 
     // ── Smooth Cα positions per secondary structure ───────────────────────────
     // Sheet: moderate smoothing removes strand-level undulation.
-    // Helix: no smoothing — the helical path is already smooth.
-    // Coil:  no smoothing — coils should follow the actual backbone.
-    //
-    // Uses a per-residue weighted blend toward the 3-point average so that
-    // only sheet Cα positions are shifted, preventing strand overlap.
+    // Helix: very light smoothing to reduce per-residue jitter without
+    //        collapsing the helical spiral.
+    // Coil:  no smoothing — coils follow the actual backbone.
     let mut ca_spline = ca_pos.clone();
-    for _ in 0..3 {
+    for pass in 0..3 {
         let prev = ca_spline.clone();
         for i in 1..n - 1 {
             let w = match ss_types[i] {
-                SecondaryStructure::Sheet => 0.25,
-                _ => 0.0,
+                SecondaryStructure::Sheet    => 0.25,
+                SecondaryStructure::Helix    => { if pass < 2 { 0.15 } else { 0.0 } }
+                SecondaryStructure::Helix310 => 0.0, // coil-like: no smoothing
+                SecondaryStructure::Coil     => 0.0,
             };
             if w > 0.0 {
                 let avg = (prev[i - 1] + prev[i] * 2.0 + prev[i + 1]) * 0.25;
@@ -263,36 +263,70 @@ fn build_segment(
         }
     }
 
-    // ── Pass 2: side vector via Parallel Transport + per-Cα O correction ─────
-    //
-    // Pure interpolation of O directions produces waviness because even a small
-    // oscillation in the projected side vector is amplified by the flat ribbon.
-    // Parallel transport is rotation-minimising: it only rotates the side vector
-    // as much as the tangent rotates, yielding a smooth ribbon.
-    // At each Cα position (every N_SUB steps) we snap to the smoothed O direction
-    // to prevent cumulative drift without reintroducing oscillation.
     let m = spos.len();
+
+    // ── Pass 2: interpolated O-direction for every spline point ────────────
+    // For helix regions we need the cross-section to gradually rotate with
+    // the winding.  Pre-compute a smoothly interpolated O direction at every
+    // spline point by slerp-ing between neighbouring Cα O vectors.
+    let mut s_o_interp: Vec<Vec3> = Vec::with_capacity(m);
+    for seg in 0..n - 1 {
+        let steps = if seg == n - 2 { N_SUB + 1 } else { N_SUB };
+        for k in 0..steps {
+            let t = k as f32 / N_SUB as f32;
+            let a = o_dir[seg];
+            let b = o_dir[seg + 1];
+            // Slerp (with sign correction for consistency)
+            let b_c = if b.dot(a) >= 0.0 { b } else { -b };
+            let interp = (a * (1.0 - t) + b_c * t).normalize_or_zero();
+            s_o_interp.push(if interp.length_squared() > 0.5 { interp } else { a });
+        }
+    }
+
+    // ── Pass 3: side vector via Parallel Transport + gradual O correction ──
+    //
+    // Parallel transport gives a rotation-minimising frame (smooth, no jumps).
+    // For helix regions we blend toward the interpolated O direction at every
+    // spline point with a small weight, so the frame gradually tracks the
+    // helical winding without sudden jumps.
+    // For sheet interiors we skip correction entirely (flat cross-section is
+    // very sensitive to even tiny frame rotations).
+    // For coil / SS boundaries we snap fully at Cα positions.
     let mut sside: Vec<Vec3> = Vec::with_capacity(m);
     {
-        // Initialise from the first O direction
         let mut side = project_perp(o_dir[0], stan[0]).normalize_or_zero();
         if side.length_squared() < 0.5 { side = orthogonal_to(stan[0]); }
 
         for i in 0..m {
-            // At each Cα boundary, optionally correct toward O direction.
-            // SKIP correction for interior sheet residues — the flat cross-section
-            // makes even a tiny frame rotation visible as a width change.
-            // Only the first CA of a sheet run gets corrected (to orient the strand).
+            let seg = (i / N_SUB).min(n - 1);
+            let ss = sss[i];
+
+            // At Cα boundaries: snap for coil / SS-transition points.
             if i > 0 && i % N_SUB == 0 {
-                let seg = (i / N_SUB).min(n - 1);
                 let is_interior_sheet = ss_types[seg] == SecondaryStructure::Sheet
                     && seg > 0
                     && ss_types[seg - 1] == SecondaryStructure::Sheet;
-                if !is_interior_sheet {
+                let is_interior_helix = ss_types[seg] == SecondaryStructure::Helix
+                    && seg > 0
+                    && ss_types[seg - 1] == SecondaryStructure::Helix;
+                if !is_interior_sheet && !is_interior_helix {
                     let o_ideal = project_perp(o_dir[seg], stan[i]).normalize_or_zero();
                     if o_ideal.length_squared() > 0.5 {
                         side = if o_ideal.dot(side) >= 0.0 { o_ideal } else { -o_ideal };
                     }
+                }
+            }
+
+            // For helix points: gradual blend toward interpolated O direction.
+            // This makes the frame track the winding smoothly.
+            if ss == SecondaryStructure::Helix && i < s_o_interp.len() {
+                let o_target = project_perp(s_o_interp[i], stan[i]).normalize_or_zero();
+                if o_target.length_squared() > 0.5 {
+                    let o_t = if o_target.dot(side) >= 0.0 { o_target } else { -o_target };
+                    // Blend weight per spline step: small enough for smoothness,
+                    // large enough to track one full turn (~3.6 residues × N_SUB steps).
+                    let blend = 0.08;
+                    side = (side * (1.0 - blend) + o_t * blend).normalize();
                 }
             }
 
@@ -440,9 +474,10 @@ fn catmull_rom_deriv(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: f32) -> Vec3 {
 /// Cross-section semi-axes (width, thickness) in Ångströms.
 fn profile_dims(ss: SecondaryStructure) -> (f32, f32) {
     match ss {
-        SecondaryStructure::Helix => (0.9, 0.70),  // near-circular tube (a:b ≈ 1.3)
-        SecondaryStructure::Sheet => (1.6, 0.10),  // very flat ribbon → arrow contrast
-        SecondaryStructure::Coil  => (0.22, 0.22),
+        SecondaryStructure::Helix    => (1.3, 0.45),  // wide ribbon, thin profile
+        SecondaryStructure::Helix310 => (0.22, 0.22), // coil-like tube (colored as helix)
+        SecondaryStructure::Sheet    => (1.6, 0.10),  // very flat ribbon → arrow contrast
+        SecondaryStructure::Coil     => (0.22, 0.22),
     }
 }
 
@@ -481,3 +516,4 @@ fn lerp_color(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
         a[2] + (b[2] - a[2]) * t,
     ]
 }
+

@@ -6,6 +6,8 @@ pub enum SecondaryStructure {
     #[default]
     Coil,
     Helix,
+    /// 3₁₀-helix: colored as Helix but drawn with Coil cross-section.
+    Helix310,
     Sheet,
 }
 

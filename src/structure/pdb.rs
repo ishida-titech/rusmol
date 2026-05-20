@@ -206,7 +206,10 @@ fn parse_helix_line(line: &str, ranges: &mut Vec<SsRange>) {
     let end_ins_ch = col_char(line, 37);
     let end_ins = if end_ins_ch == ' ' { None } else { Some(end_ins_ch) };
     if chain != end_chain { return; }
-    ranges.push(SsRange { chain, start_seq, start_ins, end_seq, end_ins, ss: SecondaryStructure::Helix });
+    // Helix type: col 39-40 (0-indexed [38..40]). Type 5 = 3₁₀-helix.
+    let helix_type = col_i32(line, 38, 40).unwrap_or(1);
+    let ss = if helix_type == 5 { SecondaryStructure::Helix310 } else { SecondaryStructure::Helix };
+    ranges.push(SsRange { chain, start_seq, start_ins, end_seq, end_ins, ss });
 }
 
 /// SHEET record:

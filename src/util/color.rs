@@ -46,9 +46,10 @@ pub fn vdw_radius(element: &str) -> f32 {
 pub fn ss_color(ss: crate::structure::atom::SecondaryStructure) -> [f32; 3] {
     use crate::structure::atom::SecondaryStructure;
     match ss {
-        SecondaryStructure::Helix => [0.85, 0.20, 0.20], // red
-        SecondaryStructure::Sheet => [0.90, 0.80, 0.10], // yellow
-        SecondaryStructure::Coil  => [0.90, 0.90, 0.90], // light gray
+        SecondaryStructure::Helix    => [0.85, 0.20, 0.20], // red
+        SecondaryStructure::Helix310 => [0.85, 0.20, 0.20], // red (same as helix)
+        SecondaryStructure::Sheet    => [0.90, 0.80, 0.10], // yellow
+        SecondaryStructure::Coil     => [0.90, 0.90, 0.90], // light gray
     }
 }
 
