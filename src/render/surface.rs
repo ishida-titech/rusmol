@@ -993,7 +993,7 @@ fn build_surface_for_atoms(
             // triangles). On a closed molecular surface every such hole is a
             // defect, so fill them all before smoothing — otherwise the gaps
             // show through as speckles, especially over a light background.
-            let local_idxs = fill_all_holes(local_idxs, HOLE_MAX_EDGES);
+            let local_idxs = fill_all_holes(&mut final_verts, local_idxs, HOLE_MAX_EDGES);
 
             // ── Step 5: Taubin smoothing (removes grid-quantization bumps) ────
             if smooth_iters > 0 {
@@ -1063,15 +1063,18 @@ fn build_surface_for_atoms(
 /// `indices` are triangle indices in the local `verts` index space. The
 /// recomputed geometric normal is re-oriented to agree with the original
 /// gradient-based normal, so it stays correct regardless of triangle winding.
-/// Fill every boundary-loop hole in a mesh by fan-triangulation.
+/// Fill every boundary-loop hole in a mesh by centroid-capping.
 ///
 /// A watertight surface has no boundary edges: every undirected edge is shared
 /// by two oppositely-wound triangles. Marching Cubes occasionally drops a
 /// triangle, leaving a small open loop that renders as a see-through hole. This
-/// chains the boundary edges into closed loops and fans each one shut. Unlike
-/// the pocket-mode filler it fills *all* loops (a closed surface has no intended
-/// rim); loops longer than `max_edges` are left alone to avoid flat sheets.
-fn fill_all_holes(mut idxs: Vec<u32>, max_edges: usize) -> Vec<u32> {
+/// walks the boundary edges into loops (consuming every outgoing edge per vertex
+/// so non-manifold junctions are handled) and caps each with a new centroid
+/// vertex fanned to reverse-wound sealing triangles. A centroid cap closes
+/// non-planar and self-touching loops that a single-anchor fan would leave open.
+/// Unlike the pocket-mode filler it fills *all* loops (a closed surface has no
+/// intended rim); loops longer than `max_edges` are left alone to avoid sheets.
+fn fill_all_holes(verts: &mut Vec<RibbonVertex>, mut idxs: Vec<u32>, max_edges: usize) -> Vec<u32> {
     use std::collections::{HashMap, HashSet};
     if idxs.len() < 3 {
         return idxs;
@@ -1106,7 +1109,7 @@ fn fill_all_holes(mut idxs: Vec<u32>, max_edges: usize) -> Vec<u32> {
     let mut n_filled = 0usize;
     let mut n_skipped = 0usize;
     for start in boundary_starts {
-        // Walk closed loops out of `start` until all its edges are consumed.
+        // Walk loops out of `start` until all its edges are consumed.
         loop {
             let p0 = *ptr.get(&start).unwrap_or(&0);
             if p0 >= adj.get(&start).map_or(0, |a| a.len()) {
@@ -1119,7 +1122,7 @@ fn fill_all_holes(mut idxs: Vec<u32>, max_edges: usize) -> Vec<u32> {
                 let p = ptr.entry(cur).or_insert(0);
                 let outs = match adj.get(&cur) {
                     Some(o) if *p < o.len() => o,
-                    _ => break, // dead end: an open path, not a closable loop
+                    _ => break, // dead end: an open path (non-manifold junction)
                 };
                 let nxt = outs[*p];
                 *p += 1;
@@ -1130,15 +1133,37 @@ fn fill_all_holes(mut idxs: Vec<u32>, max_edges: usize) -> Vec<u32> {
                     break; // loop closed
                 }
             }
-            // Only fan a walk that returned to its start (a genuine closed loop);
-            // an open path has no implicit closing edge to triangulate against.
-            // Boundary edges run lp[0]→lp[1]→…; a sealing triangle must carry the
-            // REVERSE edge, so wind it (lp[0], lp[k+1], lp[k]).
-            if closed && lp.len() >= 3 && lp.len() <= max_edges {
-                for k in 1..lp.len() - 1 {
-                    idxs.push(lp[0]);
-                    idxs.push(lp[k + 1]);
-                    idxs.push(lp[k]);
+            // Cap the loop with a centroid vertex, sealing each boundary edge
+            // lp[i]→lp[i+1] with the reverse-wound triangle (lp[i+1], lp[i], c).
+            // For a closed loop the last edge wraps lp[last]→lp[0]; an open path
+            // (rare, from non-manifold junctions) is capped without the wrap.
+            if lp.len() >= 3 && lp.len() <= max_edges {
+                let mut pos = Vec3::ZERO;
+                let mut nrm = Vec3::ZERO;
+                let mut col = [0.0f32; 3];
+                for &vi in &lp {
+                    let v = &verts[vi as usize];
+                    pos += Vec3::from(v.position);
+                    nrm += Vec3::from(v.normal);
+                    col[0] += v.color[0];
+                    col[1] += v.color[1];
+                    col[2] += v.color[2];
+                }
+                let inv = 1.0 / lp.len() as f32;
+                let c = verts.len() as u32;
+                verts.push(RibbonVertex {
+                    position: (pos * inv).to_array(),
+                    normal: nrm.normalize_or_zero().to_array(),
+                    color: [col[0] * inv, col[1] * inv, col[2] * inv],
+                    residue_id: verts[lp[0] as usize].residue_id,
+                });
+                let edges = if closed { lp.len() } else { lp.len() - 1 };
+                for i in 0..edges {
+                    let a = lp[i];
+                    let b = lp[(i + 1) % lp.len()];
+                    idxs.push(b);
+                    idxs.push(a);
+                    idxs.push(c);
                 }
                 n_filled += 1;
             } else if lp.len() >= 3 {
