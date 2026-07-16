@@ -924,14 +924,13 @@ fn build_surface_for_atoms(
         }
     }
 
-    // Cells that received an atom colour, captured before closing seals any
-    // tunnels; the sealed cells carry no colour and are inpainted afterwards.
+    // Normalize per-cell colors — using the *pre-closing* density, so the
+    // divisor matches the colour weight actually accumulated. Closing later
+    // raises density without touching color_sum, so normalizing afterwards
+    // would divide by an inflated density and bias every raised cell toward
+    // black. `colored` marks the cells with a real colour; the rest fall back
+    // to neutral grey and are inpainted after closing if it seals them.
     let colored: Vec<bool> = density.par_iter().map(|&d| d > 1e-6).collect();
-
-    // Morphological closing: seal spurious interior tunnels / narrow pits.
-    let n_sealed = close_density(&mut density, nx, ny, nz, step, SURFACE_CLOSE_RADIUS);
-
-    // Normalize per-cell colors
     let mut cell_color: Vec<[f32; 3]> = density
         .par_iter()
         .zip(color_sum.par_iter())
@@ -945,6 +944,9 @@ fn build_surface_for_atoms(
         })
         .collect();
     drop(color_sum); // free memory before MC
+
+    // Morphological closing: seal spurious interior tunnels / narrow pits.
+    let n_sealed = close_density(&mut density, nx, ny, nz, step, SURFACE_CLOSE_RADIUS);
 
     // Give the sealed tunnel cells a colour borrowed from their neighbours so
     // they blend into the surface instead of rendering as black/grey patches.
