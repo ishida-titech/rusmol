@@ -771,10 +771,15 @@ fn inpaint_colors(
         ]
     };
 
-    // Cells that need a colour: inside after closing but never coloured by an atom.
+    // Cells that need a colour: any cell whose density the closing raised above
+    // the normaliser's 1e-6 floor (so it no longer takes the neutral-grey
+    // fallback) yet which carries no atom colour of its own. This must include
+    // the sub-THRESHOLD "ramp" cells just outside ∂E, not only the sealed
+    // interior — Marching Cubes interpolates vertex colours across the isolevel,
+    // so a black ramp cell would bleed into the surface it borders.
     let targets: Vec<usize> = (0..n)
         .into_par_iter()
-        .filter(|&i| density[i] >= THRESHOLD && !colored[i])
+        .filter(|&i| density[i] > 1e-6 && !colored[i])
         .collect();
     if targets.is_empty() {
         return;
