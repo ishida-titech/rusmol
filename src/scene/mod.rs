@@ -8,6 +8,37 @@ use object::MolecularObject;
 /// Reference to a specific atom: (object_name, atom_index_within_object)
 pub type AtomRef = (String, usize);
 
+// ── SceneDirty: fine-grained dirty flags for upload_scene ───────────────────
+
+/// Bitmask indicating which parts of the GPU scene data need re-uploading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneDirty(u8);
+
+impl SceneDirty {
+    pub const NONE:    SceneDirty = SceneDirty(0);
+    /// Spheres, cylinders, backbone, lines, ghost spheres.
+    pub const ATOMS:   SceneDirty = SceneDirty(0b001);
+    /// Ribbon mesh (also includes gap dashed cylinders → implies ATOMS rebuild
+    /// for cylinder buffer, but the caller handles that).
+    pub const RIBBON:  SceneDirty = SceneDirty(0b010);
+    /// Surface mesh (most expensive).
+    pub const SURFACE: SceneDirty = SceneDirty(0b100);
+    /// All parts.
+    pub const ALL:     SceneDirty = SceneDirty(0b111);
+
+    #[inline] pub fn is_empty(self) -> bool  { self.0 == 0 }
+    #[inline] pub fn contains(self, other: SceneDirty) -> bool { self.0 & other.0 == other.0 }
+}
+
+impl std::ops::BitOr for SceneDirty {
+    type Output = Self;
+    #[inline] fn bitor(self, rhs: Self) -> Self { SceneDirty(self.0 | rhs.0) }
+}
+
+impl std::ops::BitOrAssign for SceneDirty {
+    #[inline] fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
+}
+
 #[derive(Debug, Default)]
 pub struct Scene {
     pub objects: IndexMap<String, MolecularObject>,

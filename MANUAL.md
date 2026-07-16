@@ -87,13 +87,8 @@ A toolbar at the bottom of the window provides preset view buttons:
 |--------|-------------|
 | **Default** | Ribbon (SS color) + ligand ball-and-stick (CPK) |
 | **Chain Surface** | Surface (chain color) + ligand ball-and-stick (CPK) |
-| **Binding Site** | Ligand ball-and-stick + nearby protein residues (5 A) as ball-and-stick + remaining ribbon (light gray) |
+| **Binding Site** | Ligand ball-and-stick (CPK) + nearby protein residues within 4 A as sticks (darkened CPK) + remaining ribbon (light gray). Ligand–protein hydrogen bonds are drawn as yellow dashed lines. Hydrogens are hidden. |
 | **Pocket Surface** | Ligand ball-and-stick + nearby protein surface (6 A, CPK, semi-transparent) + remaining ribbon (light gray) |
-| **All Reps** | Ribbon + surface + backbone simultaneously (SS color), white background |
-| **Backbone+Surface** | Backbone trace + semi-transparent surface (chain color) |
-| **Lines** | Wireframe representation for all atoms, dark background |
-| **Spectrum** | Ribbon with N-to-C rainbow gradient, blue background |
-| **Neon Glow** | Boosted ribbon colors + bloom effect, near-black background |
 
 ---
 
@@ -350,7 +345,8 @@ not hetatm
 
 | Name | Aliases | Description |
 |------|---------|-------------|
-| `ball_stick` | `ball-stick`, `bs`, `sticks`, `stick`, `ball_and_stick`, `spheres` | Ball-and-stick model with half-bond coloring |
+| `ball_stick` | `ball-stick`, `bs`, `ball_and_stick`, `spheres` | Ball-and-stick model with half-bond coloring |
+| `stick` | `sticks` | Uniform-radius sticks (thicker than ball-and-stick bonds); atoms are rounded to the bond radius, not van-der-Waals-scaled |
 | `backbone` | `trace`, `ca_trace`, `ca` | C-alpha backbone trace with tubes and joint spheres |
 | `ribbon` | `cartoon` | Ribbon/cartoon with secondary structure shapes |
 | `surface` | | Molecular surface (Gaussian or SES) |
@@ -540,6 +536,7 @@ Bonds are determined from:
 4. **Peptide bonds** -- Inferred from residue sequence continuity (C-N distance validated)
 5. **Disulfide bonds** -- CYS/CYX SG-SG pairs within 2.3 A
 6. **Nucleic acid backbone** -- O3'-P bonds within 1.7 A
+7. **Hydrogens** -- Hydrogens are absent from the bond tables, so any H present in the file (e.g. PDBQT polar hydrogens) is connected to its nearest heavy atom within the same residue (<= 1.3 A) so it does not float
 
 ### Loading Information
 

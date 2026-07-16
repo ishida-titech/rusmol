@@ -1,15 +1,15 @@
 use crate::render::camera::Camera;
-use crate::scene::Scene;
-use crate::structure::pdb::parse_pdb;
+use crate::scene::{Scene, SceneDirty};
+use crate::structure::pdb::{parse_pdb, parse_pdbqt};
 use crate::util::color::{chain_color, cpk_color, ss_color};
 
 use super::selection::matches as sel_matches;
 use super::{ColorSpec, Command, CommandResponse, SelectionExpr};
-use crate::scene::object::MolecularObject;
+use crate::scene::object::{MolecularObject, RepresentationType};
 
 /// Execute a command, mutating scene and/or camera.
-/// Returns (response, scene_dirty) where scene_dirty indicates GPU data needs re-upload.
-pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (CommandResponse, bool) {
+/// Returns (response, dirty_flags) indicating which GPU data parts need re-upload.
+pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (CommandResponse, SceneDirty) {
     match cmd {
         Command::Load { path, name } => {
             let obj_name = name.unwrap_or_else(|| {
@@ -18,7 +18,9 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                     .unwrap_or("mol")
                     .to_string()
             });
-            match parse_pdb(&path) {
+            let is_pdbqt = path.extension().map_or(false, |e| e.eq_ignore_ascii_case("pdbqt"));
+            let parse_result = if is_pdbqt { parse_pdbqt(&path) } else { parse_pdb(&path) };
+            match parse_result {
                 Ok(structure) => {
                     let n_atoms = structure.atoms.len();
                     let n_bonds = structure.bonds.len();
@@ -56,9 +58,9 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                     let msg = format!(
                         "Loaded '{obj_name}': {n_atoms} atoms, {n_bonds} bonds\n{summary}"
                     );
-                    (CommandResponse::Ok(msg), true)
+                    (CommandResponse::Ok(msg), SceneDirty::ALL)
                 }
-                Err(e) => (CommandResponse::Error(e.to_string()), false),
+                Err(e) => (CommandResponse::Error(e.to_string()), SceneDirty::NONE),
             }
         }
 
@@ -66,7 +68,7 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
             let atoms = collect_matching(scene, &expr);
             let count = atoms.len();
             scene.selections.insert(name.clone(), atoms);
-            (CommandResponse::Ok(format!("{count} atoms → '{name}'")), false)
+            (CommandResponse::Ok(format!("{count} atoms → '{name}'")), SceneDirty::NONE)
         }
 
         Command::Show { repr, sel } => {
@@ -75,7 +77,7 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                 return (CommandResponse::Error(
                     sel.map(|s| format!("no atoms match '{s}'"))
                         .unwrap_or_else(|| "no atoms in scene".into()),
-                ), false);
+                ), SceneDirty::NONE);
             }
             let bit = repr.to_bit();
             // When no selector is given, skip water molecules — they are hidden by
@@ -95,7 +97,7 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                     }
                 }
             }
-            (CommandResponse::Ok(format!("show {repr:?} on {n} atoms")), true)
+            (CommandResponse::Ok(format!("show {repr:?} on {n} atoms")), dirty_for_repr(repr))
         }
 
         Command::Hide { repr, sel } => {
@@ -104,7 +106,7 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                 return (CommandResponse::Error(
                     sel.map(|s| format!("no atoms match '{s}'"))
                         .unwrap_or_else(|| "no atoms in scene".into()),
-                ), false);
+                ), SceneDirty::NONE);
             }
             let bit = repr.to_bit();
             let n = atoms.len();
@@ -115,7 +117,7 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                     }
                 }
             }
-            (CommandResponse::Ok(format!("hide {repr:?} on {n} atoms")), true)
+            (CommandResponse::Ok(format!("hide {repr:?} on {n} atoms")), dirty_for_repr(repr))
         }
 
         Command::Color { spec, sel } => {
@@ -126,7 +128,7 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                     } else {
                         match crate::command::selection::parse(s) {
                             Ok(expr) => collect_matching(scene, &expr),
-                            Err(e) => return (CommandResponse::Error(e), false),
+                            Err(e) => return (CommandResponse::Error(e), SceneDirty::NONE),
                         }
                     }
                 }
@@ -140,7 +142,7 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                         sel.map(|s| format!("no atoms match '{s}'"))
                             .unwrap_or_else(|| "no atoms in scene".into()),
                     ),
-                    false,
+                    SceneDirty::NONE,
                 );
             }
 
@@ -192,24 +194,25 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                 }
             }
 
-            (CommandResponse::Ok(format!("Colored {count} atoms")), true)
+            // Color changes atom_colors which is baked into all geometry
+            (CommandResponse::Ok(format!("Colored {count} atoms")), SceneDirty::ALL)
         }
 
         Command::Enable(name) => {
             if let Some(obj) = scene.get_mut(&name) {
                 obj.visible = true;
-                (CommandResponse::Ok(format!("Enabled '{name}'")), true)
+                (CommandResponse::Ok(format!("Enabled '{name}'")), SceneDirty::ALL)
             } else {
-                (CommandResponse::Error(format!("Object '{name}' not found")), false)
+                (CommandResponse::Error(format!("Object '{name}' not found")), SceneDirty::NONE)
             }
         }
 
         Command::Disable(name) => {
             if let Some(obj) = scene.get_mut(&name) {
                 obj.visible = false;
-                (CommandResponse::Ok(format!("Disabled '{name}'")), true)
+                (CommandResponse::Ok(format!("Disabled '{name}'")), SceneDirty::ALL)
             } else {
-                (CommandResponse::Error(format!("Object '{name}' not found")), false)
+                (CommandResponse::Error(format!("Object '{name}' not found")), SceneDirty::NONE)
             }
         }
 
@@ -219,9 +222,9 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                     refs.retain(|(obj, _)| obj != &name);
                     true
                 });
-                (CommandResponse::Ok(format!("Deleted '{name}'")), true)
+                (CommandResponse::Ok(format!("Deleted '{name}'")), SceneDirty::ALL)
             } else {
-                (CommandResponse::Error(format!("Object '{name}' not found")), false)
+                (CommandResponse::Error(format!("Object '{name}' not found")), SceneDirty::NONE)
             }
         }
 
@@ -233,14 +236,14 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                     } else {
                         match crate::command::selection::parse(s) {
                             Ok(expr) => collect_matching(scene, &expr),
-                            Err(e) => return (CommandResponse::Error(e), false),
+                            Err(e) => return (CommandResponse::Error(e), SceneDirty::NONE),
                         }
                     }
                 }
                 None => scene.all_atoms(),
             };
             if atoms.is_empty() {
-                return (CommandResponse::Error("no atoms to zoom to".into()), false);
+                return (CommandResponse::Error("no atoms to zoom to".into()), SceneDirty::NONE);
             }
             // Compute bounding box and update camera
             let mut min = glam::Vec3::splat(f32::MAX);
@@ -256,7 +259,7 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
             let radius  = ((max - min).length() * 0.5).max(1.0);
             camera.center   = center;
             camera.distance = radius * 2.5;
-            (CommandResponse::Ok(String::new()), false)
+            (CommandResponse::Ok(String::new()), SceneDirty::NONE)
         }
 
         Command::Reset => {
@@ -278,95 +281,153 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
                 camera.distance = ((max - min).length() * 0.5).max(1.0) * 2.5;
                 camera.rotation = glam::Quat::IDENTITY;
             }
-            (CommandResponse::Ok(String::new()), false)
+            (CommandResponse::Ok(String::new()), SceneDirty::NONE)
         }
 
-        Command::Background(_) => (CommandResponse::Ok(String::new()), false),
-        Command::Light { .. }  => (CommandResponse::Ok(String::new()), false),
-        Command::Light2 { .. } => (CommandResponse::Ok(String::new()), false),
-        Command::Set { .. }    => (CommandResponse::Ok(String::new()), false),
-        Command::SetColor { .. } => (CommandResponse::Ok(String::new()), false),
-        Command::Get { .. }   => (CommandResponse::Ok(String::new()), false),
-        Command::Help => (CommandResponse::Ok(help_text()), false),
-        Command::Quit => (CommandResponse::Ok("bye".into()), false),
+        Command::Background(_) => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
+        Command::Light { .. }  => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
+        Command::Light2 { .. } => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
+        Command::Set { .. }    => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
+        Command::SetColor { .. } => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
+        Command::Get { .. }   => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
+        Command::Png { .. } => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
+        Command::DockTrace { .. } => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
+        Command::DockTraceNav(_) => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
+        Command::Help => (CommandResponse::Ok(help_text()), SceneDirty::NONE),
+        Command::Quit => (CommandResponse::Ok("bye".into()), SceneDirty::NONE),
+    }
+}
+
+/// Map a representation type to the appropriate dirty flags.
+fn dirty_for_repr(repr: RepresentationType) -> SceneDirty {
+    use crate::scene::object::RepresentationType::*;
+    match repr {
+        BallAndStick | Stick | Backbone | Lines => SceneDirty::ATOMS,
+        // Ribbon gaps emit dashed cylinders → also rebuild atom/cylinder buffers.
+        // Ghost spheres depend on REP_RIBBON flag.
+        Ribbon => SceneDirty::ATOMS | SceneDirty::RIBBON,
+        // Ghost spheres depend on REP_SURFACE flag.
+        Surface => SceneDirty::ATOMS | SceneDirty::SURFACE,
     }
 }
 
 fn help_text() -> String {
-    "\
+    format!("\
 ─────────────────────────────────────────────────────────────────
- rusmol — コマンド一覧
+ RusMol {version} — command reference
 ─────────────────────────────────────────────────────────────────
- ファイル
-   load <path> [, name]          PDB ファイルを読み込む
+ Commands are entered at the `RusMol>` prompt. Arguments after the
+ first are separated by commas. `sel` is an optional selection
+ expression; when omitted, a command applies to everything.
 
- 表示制御
-   show <repr> [, sel]           表現を表示
-   hide <repr> [, sel]           表現を非表示
-   enable <obj>                  オブジェクト全体を表示
-   disable <obj>                 オブジェクト全体を非表示
-   delete <obj>                  オブジェクトを削除
+ Files
+   load <path> [, name]          Load a PDB/PDBQT file",
+        version = env!("CARGO_PKG_VERSION"))
+    + "
 
-   表現名: ribbon / cartoon  ball_stick / bs / sticks
-           backbone / trace  surface  lines
+ Display
+   show <repr> [, sel]           Show a representation
+   hide <repr> [, sel]           Hide a representation
+   enable <obj>                  Show an entire object
+   disable <obj>                 Hide an entire object
+   delete <obj>                  Delete an object
 
- 選択
-   select [name,] <expr>         選択セットを作成 (デフォルト名: sele)
-   sel    [name,] <expr>         同上 (短縮形)
+   representations: ribbon / cartoon  ball_stick / bs  stick
+                    backbone / trace  surface  lines
 
-   選択式: all  chain <C>  resn <name>  resi <num|range>
-           name <atom>  elem <E>  hetatm  not  and  or  ( )
-           例: chain A and resn ALA
-               resi 1-50 or (hetatm and not resn HOH)
+ Selection
+   select [name,] <expr>         Create a selection set (default name: sele)
+   sel    [name,] <expr>         Same as above (shorthand)
 
- 色
-   color <spec> [, sel]          色を変更
-   colour <spec> [, sel]         同上 (別綴り)
+   expressions: all  chain <C>  resn <name>  resi <num|range>
+                name <atom>  elem <E>  hetatm  not  and  or  ( )
+                e.g. chain A and resn ALA
+                     resi 1-50 or (hetatm and not resn HOH)
 
-   色指定: element / cpk         CPK 元素色
-           chain / chainbows     チェーン色
-           ss / secondary        二次構造色 (helix=赤, sheet=黄, coil=灰)
-           spectrum / rainbow    N末端(青)→C末端(赤) レインボー
-           b / bfactor           B 因子 (青=低 → 白 → 赤=高)
-           red  green  blue  white  black  yellow  orange
-           purple  cyan  grey  pink  salmon  teal  marine  forest
+ Color
+   color <spec> [, sel]          Change color
+   colour <spec> [, sel]         Same as above (alternate spelling)
 
- カメラ
-   zoom [sel]                    選択 / 全体にフィット
-   reset                         カメラをデフォルト位置に戻す
+   color spec: element / cpk         CPK element colors
+               chain / chainbows     per-chain colors
+               ss / secondary        secondary structure (helix=red, sheet=yellow, coil=grey)
+               spectrum / rainbow    N-term(blue) → C-term(red) rainbow
+               b / bfactor           B-factor (blue=low → white → red=high)
+               red  green  blue  white  black  yellow  orange
+               purple  cyan  grey  pink  salmon  teal  marine  forest
 
- ライト
+ Camera
+   zoom [sel]                    Fit selection / whole scene
+   reset                         Reset camera to the default position
+
+ Lighting
    light [intensity <f>] [elevation <f>] [azimuth <f>]
-                                 光源の強度・仰角・方位角を調整
+                                 Adjust light intensity, elevation, and azimuth
 
- パラメータ設定
-   set transparency, <0-1>       サーフェス透明度 (0=不透明)
-   set edge_strength, <f>        エッジ強調 (0=オフ, 1=デフォルト)
-   set roughness, <0-1>          PBR 粗さ (0=鏡面, 1=完全拡散)
-   set metallic, <0-1>           PBR 金属度
-   set ibl_intensity, <f>        環境光 (IBL) 強度 (0=オフ, 1=デフォルト)
-   set shadow_strength, <0-1>    影の強さ (0=なし, 1=最大)  [shadow]
-   set bloom_threshold, <f>      ブルーム閾値 (デフォルト=1.0, 低い→広範囲発光)
-   set bloom_intensity, <f>      ブルーム強度 (デフォルト=0.15)  [bloom]
-   set surface_type, <type>     表面計算方式 (gaussian / ses)
-   set surface_quality, <0.2-2> グリッド解像度 Å (小さい=高品質, デフォルト=0.5)
-   set surface_color, <color> [, obj]   サーフェス色を固定
-   set cartoon_color, <color> [, obj]   リボン色を固定
-   set surface_color, default [, obj]   元の原子色に戻す
+ Settings
+   set transparency, <0-1>       Surface transparency (0=opaque)
+   set edge_strength, <f>        Edge highlight (0=off, 1=default)
+   set roughness, <0-1>          PBR roughness (0=mirror, 1=fully diffuse)
+   set metallic, <0-1>           PBR metallic
+   set ibl_intensity, <f>        Ambient (IBL) intensity (0=off, 1=default)
+   set shadow_strength, <0-1>    Shadow strength (0=none, 1=max)  [shadow]
+   set bloom_threshold, <f>      Bloom threshold (default=1.0, lower → wider glow)
+   set bloom_intensity, <f>      Bloom intensity (default=0.15)  [bloom]
+   set surface_type, <type>     Surface method (gaussian / ses)
+   set surface_quality, <0.2-2> Grid resolution in Å (smaller=finer, default=0.5)
+   set surface_smooth, <0-100>  Surface smoothing iterations (higher=smoother, default=6)
+   set surface_color, <color> [, obj]   Fix the surface color
+   set cartoon_color, <color> [, obj]   Fix the ribbon color
+   set surface_color, default [, obj]   Restore the original atom colors
 
- 背景
-   bg <color>                    背景色変更 (例: bg white / bg black)
-   background <color>            同上
+ Background
+   bg <color>                    Change background color (e.g. bg white / bg black)
+   background <color>            Same as above
 
- パラメータ確認
-   get                           全パラメータを一覧表示
-   get <name>                    指定パラメータの値を表示
+ Query
+   get                           List all parameters
+   get <name>                    Show the value of one parameter
 
- その他
-   help / h / ?                  このヘルプを表示
-   quit / q / exit               終了
+ Image export
+   png <filename>                Save a screenshot as PNG
+
+ Docking trace
+   docktrace <trace>, <ligand>   Load a trace file and enter interactive mode
+                                 (prompt: n=next  r=previous  <number>=go to row  q=quit)
+
+ Misc
+   help / h / ?                  Show this help
+   quit / q / exit               Quit
+
+ Presets (GUI toolbar)
+   Default                       Ribbon (SS) + ligand ball-and-stick
+   Chain Surface                 Per-chain surface + ligand ball-and-stick
+   Binding Site                  Ligand + protein residues within 4 A as sticks,
+                                 ligand-protein H-bonds as yellow dashes
+   Pocket Surface                Ligand + ligand-facing protein pocket surface
+
+ Mouse
+   left drag                     Rotate (arcball)
+   right drag                    Pan (translate)
+   scroll wheel                  Zoom in / out
+   left click                    Pick an atom / residue (prints its identity)
+
+ Keyboard
+   Esc                           Quit
+
+ Command line
+   rusmol <file> [more files ...]          Open one or more structures
+   rusmol <file> -c \"cmd1; cmd2; ...\"       Run commands on startup, keep prompt
+   rusmol --help                           Full command-line usage
+
+ Examples
+   show surface, chain A         Surface for chain A only
+   color ss                      Color by secondary structure
+   color spectrum, chain A       Rainbow chain A from N- to C-terminus
+   select lig, hetatm and not resn HOH    Name a ligand selection
+   color yellow, lig             Color the named selection
+   set transparency, 0.4         Make the surface semi-transparent
 ─────────────────────────────────────────────────────────────────"
-        .to_string()
 }
 
 /// Build a human-readable chain + ligand summary for a freshly loaded structure.
@@ -403,9 +464,11 @@ pub fn structure_summary(s: &crate::structure::atom::Structure) -> String {
 
     // ── Ligands (HETATM, non-water) ─────────────────────────────────────────
     // key = (chain, resname, seq_num, ins_code)
-    // We collect unique (chain, resname) groups and the residue numbers within each.
+    // We collect unique (chain, resname) groups and the residue numbers within each,
+    // plus a per-residue heavy-atom (non-hydrogen) count.
     let mut ligand_entries: BTreeMap<(char, String), BTreeSet<(i32, Option<char>)>> =
         BTreeMap::new();
+    let mut ligand_heavy: BTreeMap<(char, String, i32, Option<char>), usize> = BTreeMap::new();
 
     for atom in &s.atoms {
         if !atom.is_hetatm { continue; }
@@ -415,63 +478,103 @@ pub fn structure_summary(s: &crate::structure::atom::Structure) -> String {
             .entry((atom.residue.chain, rn.to_string()))
             .or_default()
             .insert((atom.residue.seq_num, atom.residue.ins_code));
+        if atom.element.trim() != "H" {
+            *ligand_heavy
+                .entry((atom.residue.chain, rn.to_string(),
+                        atom.residue.seq_num, atom.residue.ins_code))
+                .or_insert(0) += 1;
+        }
     }
 
     // ── Format ──────────────────────────────────────────────────────────────
-    let mut out = String::new();
+    // Build the content lines first (section headers at column 0, entries
+    // indented two spaces), then prefix each with a "| " gutter so the block
+    // reads as one grouped unit under the per-file header printed by the caller.
+    // ASCII only.
+    let mut lines: Vec<String> = Vec::new();
 
     if !chain_residues.is_empty() {
-        out.push_str("Chains:\n");
+        lines.push("- Chains".to_string());
         for (ch, residues) in &chain_residues {
             let mol_type = if chain_has_protein.contains(ch) {
                 "Protein"
             } else if chain_has_nucleic.contains(ch) {
                 "Nucleic acid"
             } else {
-                "Unknown"
+                "Other"
             };
-            let mol_name = s.compnd.get(ch).map(|n| format!("  {}", n)).unwrap_or_default();
             let first = residues.iter().next().map(|(n, _)| *n).unwrap_or(0);
             let last  = residues.iter().next_back().map(|(n, _)| *n).unwrap_or(0);
-            out.push_str(&format!(
-                "  {}  {:12}  {}-{}{}\n",
-                ch,
-                mol_type,
-                first,
-                last,
-                mol_name,
-            ));
+            // Residues with an insertion code (e.g. 1A, 1B) fall inside the
+            // numeric range, so note their count so the span reflects the true
+            // residue total (the "N residues" column would be redundant here).
+            let n_ins = residues.iter().filter(|(_, ins)| ins.is_some()).count();
+            let range = match (first == last, n_ins) {
+                (true,  0) => format!("{first}"),
+                (true,  n) => format!("{first} (+{n} ins)"),
+                (false, 0) => format!("{first}-{last}"),
+                (false, n) => format!("{first}-{last} (+{n} ins)"),
+            };
+            // Pad the range column only when a molecule name follows, so lines
+            // without a name don't carry trailing whitespace.
+            match s.compnd.get(ch) {
+                Some(name) => lines.push(format!(
+                    "  {ch}   {mol_type:<13} {range:<18}  {name}",
+                )),
+                None => lines.push(format!(
+                    "  {ch}   {mol_type:<13} {range}",
+                )),
+            }
         }
     }
 
     if !ligand_entries.is_empty() {
-        out.push_str("Ligands:\n");
-        for ((ch, resname), seqnums) in &ligand_entries {
+        lines.push("- Ligands".to_string());
+        for ((_ch, resname), seqnums) in &ligand_entries {
             let nums: Vec<String> = seqnums
                 .iter()
-                .map(|(seq, ins)| {
-                    if let Some(ic) = ins {
-                        format!("{}:{}{}", ch, seq, ic)
-                    } else {
-                        format!("{}:{}", ch, seq)
-                    }
+                .map(|(seq, ins)| match ins {
+                    Some(ic) => format!("{_ch}:{seq}{ic}"),
+                    None     => format!("{_ch}:{seq}"),
                 })
                 .collect();
+            // Heavy-atom count for one instance of this ligand (hydrogens excluded).
+            let heavy = seqnums
+                .iter()
+                .next()
+                .and_then(|(seq, ins)| {
+                    ligand_heavy.get(&(*_ch, resname.clone(), *seq, *ins)).copied()
+                })
+                .unwrap_or(0);
+            let noun = if heavy == 1 { "atom" } else { "atoms" };
+            let count = format!("({heavy} {noun})");
             // Chemical name from HETNAM, synonym from HETSYN
             let chem_name = s.hetnam.get(resname.as_str());
             let synonym   = s.hetsyn.get(resname.as_str());
             let name_str = match (chem_name, synonym) {
-                (Some(n), Some(syn)) => format!("  {}  ({})", n, syn),
-                (Some(n), None)      => format!("  {}", n),
+                (Some(n), Some(syn)) => format!("  {n} ({syn})"),
+                (Some(n), None)      => format!("  {n}"),
                 _                    => String::new(),
             };
-            out.push_str(&format!("  {:6}  {}{}\n", resname, nums.join("  "), name_str));
+            // Pad the count column only when a name follows, so lines without a
+            // chemical name don't carry trailing whitespace.
+            let positions = nums.join(", ");
+            if name_str.is_empty() {
+                lines.push(format!("  {resname:<5} {positions:<18} {count}"));
+            } else {
+                lines.push(format!("  {resname:<5} {positions:<18} {count:<11}{name_str}"));
+            }
         }
     }
 
-    // trim trailing newline
-    if out.ends_with('\n') { out.pop(); }
-    out
+    // Prefix each line with a "|" gutter so the whole block reads as one unit.
+    // Section headers start with "- " (→ "|- Chains"); entries are indented two
+    // spaces (→ "|   A ...").
+    lines
+        .iter()
+        .map(|line| format!("|{line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Collect all (obj_name, atom_idx) pairs matching `expr` across all visible objects.

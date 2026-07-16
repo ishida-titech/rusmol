@@ -9,10 +9,11 @@ use winit::{
 use glam::Vec2;
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::command::{executor, Command, CommandResponse};
+use crate::command::{executor, Command, CommandResponse, TraceAction};
+use crate::docktrace::DockTrace;
 use crate::render::{camera::Camera, state::{PickResult, RenderState}};
 use wgpu;
-use crate::scene::Scene;
+use crate::scene::{Scene, SceneDirty};
 use egui_wgpu::ScreenDescriptor;
 
 enum AppState {
@@ -44,12 +45,22 @@ pub struct App {
     /// Physical pixel position where left button was pressed (for click vs drag)
     mouse_press_pos: Option<Vec2>,
 
-    // Re-upload GPU data when true
-    scene_dirty: bool,
+    // Which parts of GPU scene data need re-uploading
+    scene_dirty: SceneDirty,
 
     // egui UI
     egui_ctx:   egui::Context,
     egui_winit: Option<egui_winit::State>,
+
+    /// Deferred quit: wait for pending_screenshot to complete before exiting.
+    pending_quit: bool,
+
+    /// Deferred screenshot path: transferred to render.pending_screenshot in
+    /// about_to_wait AFTER scene re-upload, so the capture reflects -c changes.
+    pending_screenshot_path: Option<std::path::PathBuf>,
+
+    /// Active dock trace session (None when not in trace mode).
+    dock_trace: Option<DockTrace>,
 }
 
 impl App {
@@ -71,9 +82,12 @@ impl App {
             middle_pressed: false,
             ctrl_pressed: false,
             mouse_press_pos: None,
-            scene_dirty: false,
+            scene_dirty: SceneDirty::NONE,
             egui_ctx:   egui::Context::default(),
             egui_winit: None,
+            pending_quit: false,
+            pending_screenshot_path: None,
+            dock_trace: None,
         }
     }
 }
@@ -85,7 +99,7 @@ impl ApplicationHandler for App {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title("rusmol")
+                        .with_title("RusMol")
                         .with_inner_size(PhysicalSize::new(1600u32, 1600u32)),
                 )
                 .expect("Failed to create window"),
@@ -95,7 +109,7 @@ impl ApplicationHandler for App {
         let mut render = pollster::block_on(RenderState::new(window.clone()))
             .expect("Failed to initialize GPU");
         log::info!("GPU initialized: {:.0} ms", t_start.elapsed().as_secs_f64() * 1000.0);
-        render.upload_scene(&self.scene);
+        render.upload_scene(&self.scene, SceneDirty::ALL);
         log::info!("initial scene uploaded: {:.0} ms", t_start.elapsed().as_secs_f64() * 1000.0);
 
         let (centroid, radius) = scene_bounds(&self.scene);
@@ -290,30 +304,6 @@ impl ApplicationHandler for App {
                                 if ui.button("Pocket Surface").clicked() {
                                     preset_action = Some(3);
                                 }
-                                ui.separator();
-                                if ui.button("All Reps").clicked() {
-                                    preset_action = Some(10);
-                                }
-                                ui.add_space(4.0);
-                                if ui.button("Backbone+Surface").clicked() {
-                                    preset_action = Some(11);
-                                }
-                                ui.add_space(4.0);
-                                if ui.button("Lines").clicked() {
-                                    preset_action = Some(12);
-                                }
-                                ui.add_space(4.0);
-                                if ui.button("Spectrum").clicked() {
-                                    preset_action = Some(14);
-                                }
-                                ui.add_space(4.0);
-                                if ui.button("Neon Glow").clicked() {
-                                    preset_action = Some(15);
-                                }
-                                ui.add_space(4.0);
-                                if ui.button("Dual Light").clicked() {
-                                    preset_action = Some(16);
-                                }
                             });
                         });
                 });
@@ -335,75 +325,38 @@ impl ApplicationHandler for App {
 
                 // Apply preset after rendering (scene re-upload on next about_to_wait)
                 if let Some(preset) = preset_action {
-                    let bg: Option<wgpu::Color> = match preset {
-                        10 => Some(wgpu::Color { r: 1.00, g: 1.00, b: 1.00, a: 1.0 }), // white
-                        11 => Some(wgpu::Color { r: 0.72, g: 0.72, b: 0.72, a: 1.0 }), // light gray
-                        12 => Some(wgpu::Color { r: 0.22, g: 0.22, b: 0.22, a: 1.0 }), // dark gray
-                        14 => Some(wgpu::Color { r: 0.05, g: 0.25, b: 0.70, a: 1.0 }), // vivid blue
-                        15 => Some(wgpu::Color { r: 0.02, g: 0.02, b: 0.05, a: 1.0 }), // near-black
-                        16 => Some(wgpu::Color { r: 0.08, g: 0.08, b: 0.12, a: 1.0 }), // dark blue-gray
-                        _  => None,
+                    // Pocket Surface uses a semi-transparent surface and keeps
+                    // only the ligand-facing side; other presets leave the
+                    // current transparency untouched and show the full surface.
+                    render.surface_clip_to_ligand = preset == 3;
+                    if preset == 3 {
+                        render.surface_alpha = 0.75;
+                    }
+
+                    // Reset post-processing and lighting to their defaults.
+                    render.bloom_threshold = 1.0;
+                    render.bloom_intensity = 0.0;
+                    render.light_intensity = 1.0;
+                    render.ibl_intensity = 1.0;
+                    render.edge_strength = 1.0;
+                    render.light2_intensity = 0.0;
+                    render.light_elevation_deg = 30.0;
+                    render.light_azimuth_deg = 30.0;
+
+                    match preset {
+                        0 => apply_default_view(&mut self.scene),
+                        1 => apply_chain_surface_view(&mut self.scene),
+                        2 => apply_binding_site_view(&mut self.scene),
+                        3 => apply_pocket_surface_view(&mut self.scene),
+                        _ => {}
+                    }
+                    // Hydrogen-bond dashes are shown only in the Binding Site view.
+                    render.hbond_segments = if preset == 2 {
+                        detect_ligand_hbonds(&self.scene)
+                    } else {
+                        Vec::new()
                     };
-                    if let Some(c) = bg {
-                        render.bg_color = c;
-                    }
-                    // Surface alpha per preset (Chain Surface intentionally excluded)
-                    match preset {
-                        3  => render.surface_alpha = 0.75, // Pocket Surface
-                        10 => render.surface_alpha = 0.55, // All Reps
-                        11 => render.surface_alpha = 0.70, // Backbone+Surface
-                        _  => {}
-                    }
-                    // Bloom & lighting: Neon Glow uses strong bloom; others reset
-                    match preset {
-                        15 => {
-                            render.bloom_threshold = 0.4;
-                            render.bloom_intensity = 0.6;
-                            render.light_intensity = 1.8;
-                            render.ibl_intensity = 1.5;
-                            render.edge_strength = 0.0;
-                        }
-                        _ => {
-                            render.bloom_threshold = 1.0;
-                            render.bloom_intensity = 0.0;
-                            render.light_intensity = 1.0;
-                            render.ibl_intensity = 1.0;
-                            render.edge_strength = 1.0;
-                        }
-                    }
-                    // Light2 / light direction per preset
-                    match preset {
-                        16 => {
-                            // Dual Light: key light from right, fill from left — IBL reduced
-                            render.light_elevation_deg = 20.0;
-                            render.light_azimuth_deg = 90.0;
-                            render.light_intensity = 1.5;
-                            render.light2_elevation_deg = 10.0;
-                            render.light2_azimuth_deg = -90.0;
-                            render.light2_intensity = 0.8;
-                            render.ibl_intensity = 0.3;
-                        }
-                        _ => {
-                            // Reset to defaults
-                            render.light2_intensity = 0.0;
-                            render.light_elevation_deg = 30.0;
-                            render.light_azimuth_deg = 30.0;
-                        }
-                    }
-                    match preset {
-                        0  => apply_default_view(&mut self.scene),
-                        1  => apply_chain_surface_view(&mut self.scene),
-                        2  => apply_binding_site_view(&mut self.scene),
-                        3  => apply_pocket_surface_view(&mut self.scene),
-                        10 => apply_all_reps_view(&mut self.scene),
-                        11 => apply_backbone_surface_view(&mut self.scene),
-                        12 => apply_lines_view(&mut self.scene),
-                        14 => apply_spectrum_view(&mut self.scene),
-                        15 => apply_neon_glow_view(&mut self.scene),
-                        16 => apply_default_view(&mut self.scene),
-                        _  => {}
-                    }
-                    self.scene_dirty = true;
+                    self.scene_dirty = SceneDirty::ALL;
                 }
             }
 
@@ -423,8 +376,10 @@ impl ApplicationHandler for App {
         // Process pending commands from prompt thread.
         // Collect quit separately so scene_dirty is flushed before exiting.
         let mut pending_quit = false;
-        if let Some(rx) = &self.cmd_rx {
-            while let Ok(cmd) = rx.try_recv() {
+        let commands: Vec<Command> = self.cmd_rx.as_ref()
+            .map(|rx| rx.try_iter().collect())
+            .unwrap_or_default();
+        for cmd in commands {
                 if matches!(cmd, Command::Quit) {
                     pending_quit = true;
                     if let Some(tx) = &self.resp_tx {
@@ -492,6 +447,13 @@ impl ApplicationHandler for App {
                                     need_rebuild = true;
                                 }
                             }
+                            "surface_smooth" => {
+                                let new_s = value.round().clamp(0.0, 100.0) as u32;
+                                if render.surface_smooth != new_s {
+                                    render.surface_smooth = new_s;
+                                    need_rebuild = true;
+                                }
+                            }
                             "light_intensity"  => render.light_intensity     = value.max(0.0),
                             "light_elevation"  => render.light_elevation_deg = value.clamp(-90.0, 90.0),
                             "light_azimuth"    => render.light_azimuth_deg   = value,
@@ -503,7 +465,7 @@ impl ApplicationHandler for App {
                         window.request_redraw();
                     }
                     if need_rebuild {
-                        self.scene_dirty = true;
+                        self.scene_dirty |= SceneDirty::SURFACE;
                     }
                     if let Some(tx) = &self.resp_tx {
                         let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
@@ -551,9 +513,33 @@ impl ApplicationHandler for App {
 
                 if let Command::SetColor { ref rep, color, ref sel } = cmd {
                     apply_set_color(&mut self.scene, rep, color, sel.as_deref());
-                    self.scene_dirty = true;
+                    self.scene_dirty |= dirty_for_set_color(rep);
                     if let Some(tx) = &self.resp_tx {
                         let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
+                    }
+                    continue;
+                }
+
+                if let Command::Png { path } = cmd {
+                    self.pending_screenshot_path = Some(path);
+                    if let Some(tx) = &self.resp_tx {
+                        let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
+                    }
+                    continue;
+                }
+
+                if let Command::DockTrace { trace_path, ligand_path } = cmd {
+                    let resp = self.handle_docktrace_load(&trace_path, &ligand_path);
+                    if let Some(tx) = &self.resp_tx {
+                        let _ = tx.send(resp);
+                    }
+                    continue;
+                }
+
+                if let Command::DockTraceNav(action) = cmd {
+                    let resp = self.handle_docktrace_nav(action);
+                    if let Some(tx) = &self.resp_tx {
+                        let _ = tx.send(resp);
                     }
                     continue;
                 }
@@ -561,28 +547,46 @@ impl ApplicationHandler for App {
                 let AppState::Running { camera, .. } = &mut self.state else { break };
                 let (response, dirty) = executor::execute(cmd, &mut self.scene, camera);
 
-                if dirty {
-                    self.scene_dirty = true;
-                }
+                self.scene_dirty |= dirty;
 
                 if let Some(tx) = &self.resp_tx {
                     let _ = tx.send(response);
                 }
-            }
         }
 
         // Re-upload scene if modified (must happen before quit so surface is built)
-        if self.scene_dirty {
+        if !self.scene_dirty.is_empty() {
             if let AppState::Running { render, window, .. } = &mut self.state {
-                render.upload_scene(&self.scene);
+                render.upload_scene(&self.scene, self.scene_dirty);
                 window.request_redraw();
             }
-            self.scene_dirty = false;
+            self.scene_dirty = SceneDirty::NONE;
+        }
+
+        // Transfer deferred screenshot to render AFTER scene re-upload
+        if let Some(path) = self.pending_screenshot_path.take() {
+            if let AppState::Running { render, window, .. } = &mut self.state {
+                render.pending_screenshot = Some(path);
+                window.request_redraw();
+            }
         }
 
         if pending_quit {
-            event_loop.exit();
-            return;
+            self.pending_quit = true;
+        }
+
+        // Deferred quit: wait until pending_screenshot is consumed
+        if self.pending_quit {
+            let screenshot_done = match &self.state {
+                AppState::Running { render, .. } => render.pending_screenshot.is_none(),
+                _ => true,
+            };
+            if screenshot_done {
+                event_loop.exit();
+                return;
+            } else if let AppState::Running { window, .. } = &self.state {
+                window.request_redraw();
+            }
         }
 
     }
@@ -638,6 +642,11 @@ impl App {
         use crate::command::parser::parse_command;
         match parse_command(line) {
             Ok(cmd) => {
+                // Quit via -c: defer to about_to_wait so screenshots can complete
+                if matches!(cmd, Command::Quit) {
+                    self.pending_quit = true;
+                    return;
+                }
                 // Background / Light are handled here rather than in executor (need render access)
                 if let Command::Background(rgb) = cmd {
                     if let AppState::Running { render, .. } = &mut self.state {
@@ -711,6 +720,13 @@ impl App {
                                     need_rebuild = true;
                                 }
                             }
+                            "surface_smooth" => {
+                                let new_s = value.round().clamp(0.0, 100.0) as u32;
+                                if render.surface_smooth != new_s {
+                                    render.surface_smooth = new_s;
+                                    need_rebuild = true;
+                                }
+                            }
                             "light_intensity"  => render.light_intensity     = value.max(0.0),
                             "light_elevation"  => render.light_elevation_deg = value.clamp(-90.0, 90.0),
                             "light_azimuth"    => render.light_azimuth_deg   = value,
@@ -721,18 +737,22 @@ impl App {
                         }
                     }
                     if need_rebuild {
-                        self.scene_dirty = true;
+                        self.scene_dirty |= SceneDirty::SURFACE;
                     }
                     return;
                 }
                 if let Command::SetColor { ref rep, color, ref sel } = cmd {
                     apply_set_color(&mut self.scene, rep, color, sel.as_deref());
-                    self.scene_dirty = true;
+                    self.scene_dirty |= dirty_for_set_color(rep);
+                    return;
+                }
+                if let Command::Png { path } = cmd {
+                    self.pending_screenshot_path = Some(path);
                     return;
                 }
                 let AppState::Running { camera, .. } = &mut self.state else { return };
                 let (response, dirty) = executor::execute(cmd, &mut self.scene, camera);
-                if dirty { self.scene_dirty = true; }
+                self.scene_dirty |= dirty;
                 match response {
                     CommandResponse::Ok(msg) if !msg.is_empty() => println!("{msg}"),
                     CommandResponse::Error(msg) => eprintln!("Error: {msg}"),
@@ -741,6 +761,182 @@ impl App {
             }
             Err(e) => eprintln!("Parse error: {e}"),
         }
+    }
+
+    fn handle_docktrace_load(
+        &mut self,
+        trace_path: &std::path::Path,
+        ligand_path: &std::path::Path,
+    ) -> CommandResponse {
+        let dt = match DockTrace::load(trace_path, ligand_path) {
+            Ok(dt) => dt,
+            Err(e) => return CommandResponse::Error(format!("docktrace: {e}")),
+        };
+
+        let ligand_structure = match crate::structure::pdb::parse_pdbqt(ligand_path) {
+            Ok(s) => s,
+            Err(e) => return CommandResponse::Error(format!("docktrace ligand: {e}")),
+        };
+
+        let positions = dt.reconstruct_positions();
+        let info = dt.step_info();
+        let step = dt.current_step;
+        let total = dt.total_steps();
+
+        let mut structure = ligand_structure;
+        for (i, pos) in positions.iter().enumerate() {
+            if i < structure.atoms.len() {
+                structure.atoms[i].position = *pos;
+            }
+        }
+
+        let obj_name = "_docktrace_ligand".to_string();
+        self.scene.remove(&obj_name);
+
+        use crate::scene::object::{MolecularObject, REP_BALL_STICK};
+        use crate::util::color::cpk_color;
+        let mut obj = MolecularObject::new(obj_name.clone(), structure);
+        for (i, atom) in obj.structure.atoms.iter().enumerate() {
+            obj.atom_rep_show[i] = REP_BALL_STICK;
+            obj.atom_colors[i] = cpk_color(&atom.element);
+        }
+        self.scene.add_object(obj);
+
+        // Add box wireframe
+        self.add_docktrace_box(&dt.header);
+
+        // Zoom camera to ligand + box
+        if let AppState::Running { camera, window, .. } = &mut self.state {
+            let center = dt.header.box_center;
+            let half = dt.header.box_size * 0.5;
+            let radius = half.length().max(5.0);
+            camera.center = center;
+            camera.distance = radius * 3.0;
+            window.request_redraw();
+        }
+
+        self.scene_dirty = SceneDirty::ALL;
+        self.dock_trace = Some(dt);
+
+        CommandResponse::DockTraceStep { step, total, info }
+    }
+
+    fn handle_docktrace_nav(&mut self, action: TraceAction) -> CommandResponse {
+        let dt = match &mut self.dock_trace {
+            Some(dt) => dt,
+            None => return CommandResponse::Error("not in dock trace mode".into()),
+        };
+
+        match action {
+            TraceAction::Next => {
+                if !dt.next() {
+                    return CommandResponse::Error("already at last step".into());
+                }
+            }
+            TraceAction::Prev => {
+                if !dt.prev() {
+                    return CommandResponse::Error("already at first step".into());
+                }
+            }
+            TraceAction::GoTo(row) => {
+                if row == 0 || row > dt.total_steps() {
+                    return CommandResponse::Error(format!("row out of range (1-{})", dt.total_steps()));
+                }
+                dt.current_step = row - 1;
+            }
+            TraceAction::Quit => {
+                self.scene.remove("_docktrace_ligand");
+                self.scene.remove("_docktrace_box");
+                self.dock_trace = None;
+                self.scene_dirty = SceneDirty::ALL;
+                if let AppState::Running { window, .. } = &self.state {
+                    window.request_redraw();
+                }
+                return CommandResponse::DockTraceExit;
+            }
+        }
+
+        let positions = dt.reconstruct_positions();
+        let info = dt.step_info();
+        let step = dt.current_step;
+        let total = dt.total_steps();
+
+        if let Some(obj) = self.scene.get_mut("_docktrace_ligand") {
+            for (i, pos) in positions.iter().enumerate() {
+                if i < obj.structure.atoms.len() {
+                    obj.structure.atoms[i].position = *pos;
+                }
+            }
+        }
+
+        self.scene_dirty |= SceneDirty::ATOMS;
+        if let AppState::Running { window, .. } = &self.state {
+            window.request_redraw();
+        }
+
+        CommandResponse::DockTraceStep { step, total, info }
+    }
+
+    fn add_docktrace_box(&mut self, header: &crate::docktrace::TraceHeader) {
+        use crate::structure::atom::{Atom, Bond, ResidueId, Structure};
+        use crate::scene::object::{MolecularObject, REP_LINES};
+
+        let center = header.box_center;
+        let half = header.box_size * 0.5;
+
+        let corners = [
+            center + glam::Vec3::new(-half.x, -half.y, -half.z),
+            center + glam::Vec3::new( half.x, -half.y, -half.z),
+            center + glam::Vec3::new( half.x,  half.y, -half.z),
+            center + glam::Vec3::new(-half.x,  half.y, -half.z),
+            center + glam::Vec3::new(-half.x, -half.y,  half.z),
+            center + glam::Vec3::new( half.x, -half.y,  half.z),
+            center + glam::Vec3::new( half.x,  half.y,  half.z),
+            center + glam::Vec3::new(-half.x,  half.y,  half.z),
+        ];
+
+        let edges: [(usize, usize); 12] = [
+            (0,1),(1,2),(2,3),(3,0),
+            (4,5),(5,6),(6,7),(7,4),
+            (0,4),(1,5),(2,6),(3,7),
+        ];
+
+        let res_id = ResidueId {
+            chain: 'Z',
+            seq_num: 999,
+            ins_code: None,
+            name: "BOX".to_string(),
+        };
+
+        let atoms: Vec<Atom> = corners.iter().enumerate().map(|(i, &pos)| Atom {
+            serial: (i + 1) as u32,
+            name: format!(" X{:<2}", i + 1),
+            alt_loc: None,
+            residue: res_id.clone(),
+            position: pos,
+            temp_factor: 0.0,
+            element: "X".to_string(),
+            is_hetatm: true,
+        }).collect();
+
+        let bonds: Vec<Bond> = edges.iter().map(|&(a, b)| Bond { atom1: a, atom2: b }).collect();
+
+        let structure = Structure {
+            atoms,
+            bonds,
+            ss: vec![],
+            ..Default::default()
+        };
+
+        let obj_name = "_docktrace_box".to_string();
+        self.scene.remove(&obj_name);
+
+        let mut obj = MolecularObject::new(obj_name, structure);
+        for i in 0..obj.atom_rep_show.len() {
+            obj.atom_rep_show[i] = REP_LINES;
+            obj.atom_colors[i] = [0.5, 0.5, 0.5];
+        }
+        self.scene.add_object(obj);
     }
 }
 
@@ -893,33 +1089,103 @@ fn near_ligand_residues(
     residues
 }
 
-/// Preset 3: Binding Site — ligand BallAndStick + nearby protein residues BallAndStick.
-/// - Ligand: BallAndStick + CPK colors
-/// - Protein within 5 Å of ligand (by residue): BallAndStick + chain color
-/// - Remaining protein: Ribbon + dim gray
-/// - Water: hidden
-fn apply_binding_site_view(scene: &mut Scene) {
-    use crate::scene::object::{REP_BALL_STICK, REP_RIBBON};
-    use crate::util::color::cpk_color;
+/// A polar atom that can take part in a hydrogen bond, with the positions of any
+/// covalently bonded hydrogens (empty when the structure has no explicit H).
+struct PolarAtom {
+    pos: glam::Vec3,
+    h_pos: Vec<glam::Vec3>,
+}
+
+/// True if `donor` (bearing a hydrogen) forms a hydrogen bond to `acceptor`:
+/// some H sits within `max_ha` of the acceptor with a D–H···A angle ≥ 120°.
+fn is_hbond_geometry(donor: &PolarAtom, acceptor: &PolarAtom, max_ha: f32) -> bool {
+    const MAX_COS: f32 = -0.5; // cos(120°): D–H···A must be at least 120°
+    for &h in &donor.h_pos {
+        if h.distance(acceptor.pos) > max_ha { continue; }
+        let to_d = (donor.pos - h).normalize_or_zero();
+        let to_a = (acceptor.pos - h).normalize_or_zero();
+        if to_d.dot(to_a) <= MAX_COS { return true; }
+    }
+    false
+}
+
+/// Detect hydrogen bonds between the target ligand and the protein for the
+/// Binding Site view. Candidate atoms are electronegative (N/O/S/F). When
+/// hydrogens are present the D–H···A geometry is checked; otherwise a plain
+/// donor···acceptor heavy-atom distance is used. Returns heavy-atom endpoint
+/// pairs to be drawn as dashed lines.
+fn detect_ligand_hbonds(scene: &Scene) -> Vec<(glam::Vec3, glam::Vec3)> {
     const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
-    const CUTOFF: f32 = 5.0;
-    const DIM_GRAY: [f32; 3] = [0.75, 0.75, 0.75];
+    const MAX_DA: f32 = 3.5; // donor···acceptor heavy-atom distance
+    const MIN_DA: f32 = 2.4;
+    const MAX_HA: f32 = 2.7; // H···acceptor distance
 
-    let ligand_positions = collect_ligand_positions(scene);
-    let target_resn = largest_ligand_resn(scene);
+    let Some(target) = largest_ligand_resn(scene) else { return Vec::new() };
 
-    // Build chain → color index map (stable across objects)
-    let mut chain_index: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
-    let mut next_idx = 0usize;
+    let mut lig: Vec<PolarAtom> = Vec::new();
+    let mut pro: Vec<PolarAtom> = Vec::new();
+
     for (_, obj) in scene.iter() {
-        for atom in &obj.structure.atoms {
-            if obj.structure.is_polymer_atom(atom) {
-                chain_index.entry(atom.residue.chain).or_insert_with(|| {
-                    let i = next_idx; next_idx += 1; i
-                });
+        let atoms = &obj.structure.atoms;
+        // Map heavy-atom index → positions of its bonded hydrogens.
+        let mut h_of: std::collections::HashMap<usize, Vec<glam::Vec3>> = std::collections::HashMap::new();
+        for b in &obj.structure.bonds {
+            let (i, j) = (b.atom1, b.atom2);
+            if i >= atoms.len() || j >= atoms.len() { continue; }
+            if atoms[i].element == "H" { h_of.entry(j).or_default().push(atoms[i].position); }
+            if atoms[j].element == "H" { h_of.entry(i).or_default().push(atoms[j].position); }
+        }
+        for (i, atom) in atoms.iter().enumerate() {
+            if !matches!(atom.element.as_str(), "N" | "O" | "S" | "F") { continue; }
+            let is_water = WATERS.contains(&atom.residue.name.trim());
+            let is_ligand = atom.is_hetatm && !is_water && atom.residue.name.trim() == target;
+            let is_protein = obj.structure.is_polymer_atom(atom);
+            if !is_ligand && !is_protein { continue; }
+            let p = PolarAtom {
+                pos: atom.position,
+                h_pos: h_of.get(&i).cloned().unwrap_or_default(),
+            };
+            if is_ligand { lig.push(p); } else { pro.push(p); }
+        }
+    }
+
+    // If no hydrogens are present anywhere, fall back to distance-only pairing.
+    let any_h = lig.iter().chain(pro.iter()).any(|p| !p.h_pos.is_empty());
+
+    let mut out = Vec::new();
+    for l in &lig {
+        for p in &pro {
+            let d = l.pos.distance(p.pos);
+            if !(MIN_DA..=MAX_DA).contains(&d) { continue; }
+            let hbond = if any_h {
+                is_hbond_geometry(l, p, MAX_HA) || is_hbond_geometry(p, l, MAX_HA)
+            } else {
+                true // both are electronegative and within donor···acceptor range
+            };
+            if hbond {
+                out.push((l.pos, p.pos));
             }
         }
     }
+    out
+}
+
+/// Preset 3: Binding Site — ligand BallAndStick + nearby protein residues BallAndStick.
+/// - Ligand: BallAndStick + CPK colors
+/// - Protein within 4 Å of ligand (by residue): BallAndStick + chain color
+/// - Remaining protein: Ribbon + dim gray
+/// - Water: hidden
+fn apply_binding_site_view(scene: &mut Scene) {
+    use crate::scene::object::{REP_BALL_STICK, REP_RIBBON, REP_STICK};
+    use crate::util::color::cpk_color;
+    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
+    const CUTOFF: f32 = 4.0;
+    // Match the darkened-CPK carbon of the binding-site sticks so the distant
+    // ribbon reads as almost the same tone (cpk carbon 0.5 × DARKEN 0.25 = 0.125).
+    const DIM_GRAY: [f32; 3] = [0.125, 0.125, 0.125];
+
+    let ligand_positions = collect_ligand_positions(scene);
+    let target_resn = largest_ligand_resn(scene);
 
     // Collect near-ligand residues per object (need separate pass because borrow rules)
     let near_residues: std::collections::HashMap<String, std::collections::HashSet<(char, i32, Option<char>)>> =
@@ -934,7 +1200,11 @@ fn apply_binding_site_view(scene: &mut Scene) {
             let is_polymer = obj.structure.is_polymer_atom(atom);
             let res_key = (atom.residue.chain, atom.residue.seq_num, atom.residue.ins_code);
 
-            if is_water {
+            if atom.element == "H" {
+                // Hide hydrogens — heavy atoms only for a clean binding-site view.
+                obj.atom_rep_show[i] = 0;
+                obj.atom_colors[i] = cpk_color(&atom.element);
+            } else if is_water {
                 obj.atom_rep_show[i] = 0;
                 obj.atom_colors[i] = cpk_color(&atom.element);
             } else if !is_polymer && target_resn.as_deref() == Some(atom.residue.name.trim()) {
@@ -946,10 +1216,10 @@ fn apply_binding_site_view(scene: &mut Scene) {
                 obj.atom_rep_show[i] = 0;
                 obj.atom_colors[i] = cpk_color(&atom.element);
             } else if near.contains(&res_key) {
-                // Near-ligand protein residue
-                obj.atom_rep_show[i] = REP_BALL_STICK;
-                let idx = chain_index.get(&atom.residue.chain).copied().unwrap_or(0);
-                obj.atom_colors[i] = crate::util::color::chain_color(idx);
+                // Near-ligand protein residue — plain sticks, darkened CPK so the
+                // protein reads as distinct from the full-brightness ligand.
+                obj.atom_rep_show[i] = REP_STICK;
+                obj.atom_colors[i] = crate::util::color::cpk_dark(&atom.element);
             } else {
                 // Distant protein
                 obj.atom_rep_show[i] = REP_RIBBON;
@@ -1006,224 +1276,18 @@ fn apply_pocket_surface_view(scene: &mut Scene) {
     }
 }
 
-/// Preset 5: B-Factor — Ribbon colored by B-factor + ligand BallAndStick.
-/// - Protein: Ribbon + B-factor colors (blue=low → white=mid → red=high)
-/// - Ligand: BallAndStick + CPK colors
-/// - Water: hidden
-// ── Dev presets ──────────────────────────────────────────────────────────────
-
-/// Dev preset: All Reps — show Ribbon + Surface + Backbone simultaneously on polymer.
-fn apply_all_reps_view(scene: &mut Scene) {
-    use crate::scene::object::{REP_BACKBONE, REP_BALL_STICK, REP_RIBBON, REP_SURFACE};
-    use crate::structure::atom::SecondaryStructure;
-    use crate::util::color::{cpk_color, ss_color};
-    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
-
-    for (_, obj) in scene.iter_mut() {
-        for (i, atom) in obj.structure.atoms.iter().enumerate() {
-            let is_water = WATERS.contains(&atom.residue.name.trim());
-            if is_water {
-                obj.atom_rep_show[i] = 0;
-                obj.atom_colors[i] = cpk_color(&atom.element);
-            } else if obj.structure.is_polymer_atom(atom) {
-                obj.atom_rep_show[i] = REP_RIBBON | REP_SURFACE | REP_BACKBONE;
-                let ss = obj.structure.ss.get(i).copied().unwrap_or(SecondaryStructure::Coil);
-                obj.atom_colors[i] = ss_color(ss);
-            } else {
-                obj.atom_rep_show[i] = REP_BALL_STICK;
-                obj.atom_colors[i] = cpk_color(&atom.element);
-            }
-        }
-    }
-}
-
-/// Dev preset: Backbone + Surface — Cα trace inside transparent surface.
-fn apply_backbone_surface_view(scene: &mut Scene) {
-    use crate::scene::object::{REP_BACKBONE, REP_BALL_STICK, REP_SURFACE};
-    use crate::util::color::{chain_color, cpk_color};
-    use std::collections::HashMap;
-    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
-
-    let mut chain_index: HashMap<char, usize> = HashMap::new();
-    let mut next_idx = 0usize;
-    for (_, obj) in scene.iter() {
-        for atom in &obj.structure.atoms {
-            if obj.structure.is_polymer_atom(atom) {
-                chain_index.entry(atom.residue.chain).or_insert_with(|| {
-                    let i = next_idx; next_idx += 1; i
-                });
-            }
-        }
-    }
-
-    for (_, obj) in scene.iter_mut() {
-        for (i, atom) in obj.structure.atoms.iter().enumerate() {
-            let is_water = WATERS.contains(&atom.residue.name.trim());
-            if is_water {
-                obj.atom_rep_show[i] = 0;
-                obj.atom_colors[i] = cpk_color(&atom.element);
-            } else if obj.structure.is_polymer_atom(atom) {
-                obj.atom_rep_show[i] = REP_BACKBONE | REP_SURFACE;
-                let idx = chain_index.get(&atom.residue.chain).copied().unwrap_or(0);
-                obj.atom_colors[i] = chain_color(idx);
-            } else {
-                obj.atom_rep_show[i] = REP_BALL_STICK;
-                obj.atom_colors[i] = cpk_color(&atom.element);
-            }
-        }
-    }
-}
-
-/// Dev preset: Lines — wireframe bond representation for everything.
-fn apply_lines_view(scene: &mut Scene) {
-    use crate::scene::object::REP_LINES;
-    use crate::util::color::{chain_color, cpk_color};
-    use std::collections::HashMap;
-    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
-
-    let mut chain_index: HashMap<char, usize> = HashMap::new();
-    let mut next_idx = 0usize;
-    for (_, obj) in scene.iter() {
-        for atom in &obj.structure.atoms {
-            if obj.structure.is_polymer_atom(atom) {
-                chain_index.entry(atom.residue.chain).or_insert_with(|| {
-                    let i = next_idx; next_idx += 1; i
-                });
-            }
-        }
-    }
-
-    for (_, obj) in scene.iter_mut() {
-        for (i, atom) in obj.structure.atoms.iter().enumerate() {
-            let is_water = WATERS.contains(&atom.residue.name.trim());
-            if is_water {
-                obj.atom_rep_show[i] = 0;
-            } else {
-                obj.atom_rep_show[i] = REP_LINES;
-                obj.atom_colors[i] = if obj.structure.is_polymer_atom(atom) {
-                    let idx = chain_index.get(&atom.residue.chain).copied().unwrap_or(0);
-                    chain_color(idx)
-                } else {
-                    cpk_color(&atom.element)
-                };
-            }
-        }
-    }
-}
-
-
-/// Dev preset: Spectrum — Ribbon with N→C rainbow gradient per chain.
-fn apply_spectrum_view(scene: &mut Scene) {
-    use crate::scene::object::{REP_BALL_STICK, REP_RIBBON};
-    use crate::util::color::cpk_color;
-    use std::collections::HashMap;
-    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
-
-    // First pass: set representations
-    for (_, obj) in scene.iter_mut() {
-        for (i, atom) in obj.structure.atoms.iter().enumerate() {
-            let is_water = WATERS.contains(&atom.residue.name.trim());
-            if is_water {
-                obj.atom_rep_show[i] = 0;
-                obj.atom_colors[i] = cpk_color(&atom.element);
-            } else if obj.structure.is_polymer_atom(atom) {
-                obj.atom_rep_show[i] = REP_RIBBON;
-                // colors assigned below
-            } else {
-                obj.atom_rep_show[i] = REP_BALL_STICK;
-                obj.atom_colors[i] = cpk_color(&atom.element);
-            }
-        }
-    }
-
-    // Second pass: compute per-chain spectrum gradient for polymer atoms
-    for (_, obj) in scene.iter_mut() {
-        // Group polymer atoms by chain → sorted by (seq_num, ins_code)
-        let mut groups: HashMap<char, Vec<(i32, Option<char>, usize)>> = HashMap::new();
-        for (i, atom) in obj.structure.atoms.iter().enumerate() {
-            if obj.structure.is_polymer_atom(atom) {
-                groups.entry(atom.residue.chain).or_default()
-                    .push((atom.residue.seq_num, atom.residue.ins_code, i));
-            }
-        }
-        for entries in groups.values_mut() {
-            entries.sort_unstable_by_key(|&(seq, ins, _)| (seq, ins));
-            let n = entries.len();
-            for (rank, &(_, _, atom_idx)) in entries.iter().enumerate() {
-                let t = if n > 1 { rank as f32 / (n - 1) as f32 } else { 0.5 };
-                obj.atom_colors[atom_idx] = spectrum_color(t);
-            }
-        }
-    }
-}
-
-/// Neon Glow preset: bright spectrum colors on dark background, designed for bloom.
-fn apply_neon_glow_view(scene: &mut Scene) {
-    use crate::scene::object::{REP_BALL_STICK, REP_RIBBON};
-    use crate::util::color::cpk_color;
-    use std::collections::HashMap;
-    const WATERS: &[&str] = &["HOH", "WAT", "DOD"];
-
-    // Ribbon for polymer, BallAndStick for ligands, hide water
-    for (_, obj) in scene.iter_mut() {
-        for (i, atom) in obj.structure.atoms.iter().enumerate() {
-            let is_water = WATERS.contains(&atom.residue.name.trim());
-            if is_water {
-                obj.atom_rep_show[i] = 0;
-                obj.atom_colors[i] = cpk_color(&atom.element);
-            } else if obj.structure.is_polymer_atom(atom) {
-                obj.atom_rep_show[i] = REP_RIBBON;
-            } else {
-                obj.atom_rep_show[i] = REP_BALL_STICK;
-                // Bright neon CPK for ligands
-                let c = cpk_color(&atom.element);
-                obj.atom_colors[i] = [c[0] * 1.5, c[1] * 1.5, c[2] * 1.5];
-            }
-        }
-    }
-
-    // Bright saturated spectrum colors for polymer (boosted for bloom)
-    for (_, obj) in scene.iter_mut() {
-        let mut groups: HashMap<char, Vec<(i32, Option<char>, usize)>> = HashMap::new();
-        for (i, atom) in obj.structure.atoms.iter().enumerate() {
-            if obj.structure.is_polymer_atom(atom) {
-                groups.entry(atom.residue.chain).or_default()
-                    .push((atom.residue.seq_num, atom.residue.ins_code, i));
-            }
-        }
-        for entries in groups.values_mut() {
-            entries.sort_unstable_by_key(|&(seq, ins, _)| (seq, ins));
-            let n = entries.len();
-            for (rank, &(_, _, atom_idx)) in entries.iter().enumerate() {
-                let t = if n > 1 { rank as f32 / (n - 1) as f32 } else { 0.5 };
-                let c = spectrum_color(t);
-                // Boost colors above 1.0 so they trigger bloom
-                obj.atom_colors[atom_idx] = [c[0] * 1.6, c[1] * 1.6, c[2] * 1.6];
-            }
-        }
-    }
-}
-
-/// HSV rainbow: t=0 → blue (240°), t=1 → red (0°).
-fn spectrum_color(t: f32) -> [f32; 3] {
-    let h = 240.0 * (1.0 - t.clamp(0.0, 1.0));
-    let h6 = h / 60.0;
-    let i = h6 as u32;
-    let f = h6 - i as f32;
-    match i {
-        0 => [1.0, f,   0.0],
-        1 => [1.0 - f, 1.0, 0.0],
-        2 => [0.0, 1.0, f],
-        3 => [0.0, 1.0 - f, 1.0],
-        4 => [f,   0.0, 1.0],
-        _ => [1.0, 0.0, 1.0 - f],
-    }
-}
-
 /// Apply a per-representation color override to matching objects.
 /// `rep`: "surface" or "ribbon".
 /// `color`: Some(rgb) to set override, None to reset to per-atom colors.
 /// `sel`: optional object name filter; None means all objects.
+fn dirty_for_set_color(rep: &str) -> SceneDirty {
+    match rep {
+        "surface" => SceneDirty::SURFACE,
+        "ribbon"  => SceneDirty::ATOMS | SceneDirty::RIBBON,
+        _         => SceneDirty::ALL,
+    }
+}
+
 fn apply_set_color(scene: &mut Scene, rep: &str, color: Option<[f32; 3]>, sel: Option<&str>) {
     for (name, obj) in scene.iter_mut() {
         if let Some(target) = sel {

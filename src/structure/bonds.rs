@@ -84,6 +84,11 @@ pub fn build_bonds_cif(structure: &mut Structure, conect: &[(u32, u32)]) {
     // CONECT records: always applied last so they can supplement CIF or builtin bonds
     add_conect_bonds(structure, conect);
 
+    // Hydrogens are absent from the built-in / CCD bond tables, so any H present in
+    // the input (e.g. PDBQT polar hydrogens) would otherwise render as a floating
+    // sphere. Connect each still-bondless H to its nearest heavy atom by distance.
+    add_hydrogen_bonds(structure);
+
     log::debug!(
         "Built {} bonds for {} atoms",
         structure.bonds.len(),
@@ -220,6 +225,63 @@ fn is_consecutive(seq1: i32, ins1: Option<char>, seq2: i32, ins2: Option<char>) 
     } else {
         false
     }
+}
+
+// ── Hydrogen bonds (connectivity, not H-bonds) ──────────────────────────────────
+
+/// Connect hydrogens to their nearest heavy atom. The built-in and CCD bond
+/// tables only cover heavy atoms, so hydrogens present in the input arrive with
+/// no connectivity. Only hydrogens that are still bondless are considered (so
+/// explicit CONECT/CCD hydrogen bonds are preserved), and the search is limited
+/// to the same residue — where a covalent X–H partner always lives.
+fn add_hydrogen_bonds(structure: &mut Structure) {
+    use std::collections::HashSet;
+    /// Upper bound for an X–H covalent bond length (Å). Real X–H is ~0.9–1.1 Å.
+    const MAX_XH: f32 = 1.3;
+
+    let mut bonded: HashSet<usize> = HashSet::new();
+    for b in &structure.bonds {
+        bonded.insert(b.atom1);
+        bonded.insert(b.atom2);
+    }
+
+    // Group atom indices by residue so the nearest-heavy-atom search stays local.
+    type ResKey = (char, i32, Option<char>, String);
+    let mut residue_atoms: HashMap<ResKey, Vec<usize>> = HashMap::new();
+    for (i, atom) in structure.atoms.iter().enumerate() {
+        let key = (
+            atom.residue.chain,
+            atom.residue.seq_num,
+            atom.residue.ins_code,
+            atom.residue.name.clone(),
+        );
+        residue_atoms.entry(key).or_default().push(i);
+    }
+
+    let mut new_bonds: Vec<Bond> = Vec::new();
+    for indices in residue_atoms.values() {
+        for &i in indices {
+            let atom = &structure.atoms[i];
+            if atom.element != "H" || bonded.contains(&i) {
+                continue;
+            }
+            let mut best: Option<(usize, f32)> = None;
+            for &j in indices {
+                if j == i || structure.atoms[j].element == "H" {
+                    continue;
+                }
+                let d = (atom.position - structure.atoms[j].position).length();
+                if d <= MAX_XH && best.map_or(true, |(_, bd)| d < bd) {
+                    best = Some((j, d));
+                }
+            }
+            if let Some((j, _)) = best {
+                let (lo, hi) = if i < j { (i, j) } else { (j, i) };
+                new_bonds.push(Bond { atom1: lo, atom2: hi });
+            }
+        }
+    }
+    structure.bonds.extend(new_bonds);
 }
 
 // ── CONECT bonds ───────────────────────────────────────────────────────────────

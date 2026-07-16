@@ -152,19 +152,39 @@ fn vs_main(in: VertIn) -> VertOut {
 fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     let V = normalize(u.camera_pos - in.world_pos);
     let raw_N = normalize(in.world_nrm);
-    // MC gradient normals are always outward; flip only if facing away from camera
-    // (back face visible through open regions of the mesh).
-    let N = select(-raw_N, raw_N, dot(raw_N, V) >= 0.0);
+    // MC gradient normals always point outward. When the outward normal faces
+    // away from the camera we are looking at the *inside* (back face) of the
+    // mesh, e.g. through an opening in the surface.
+    let is_back = dot(raw_N, V) < 0.0;
+    // Camera-facing normal for shading.
+    var N = select(-raw_N, raw_N, dot(raw_N, V) >= 0.0);
+
+    var albedo = in.color;
+    var rough  = u.roughness;
+
+    // Back faces get a dark matte gray with a procedural bump so the inside of
+    // the surface is obviously different from the (smooth, colored) front.
+    if is_back {
+        albedo = vec3<f32>(0.16, 0.16, 0.18);
+        rough  = 0.9;
+        let freq   = 2.5;
+        let grad   = vec3<f32>(cos(in.world_pos.x * freq),
+                               cos(in.world_pos.y * freq),
+                               cos(in.world_pos.z * freq));
+        let grad_t = grad - N * dot(grad, N);   // tangential component
+        N = normalize(N - grad_t * 0.6);        // perturb normal → bumpy look
+    }
+
     let L = normalize(u.light_dir);
 
     let shadow = mix(1.0, shadow_factor(in.world_pos), u.shadow_strength);
-    var color = shadow * pbr_direct(N, V, L, in.color, u.roughness, u.metallic, u.light_intensity)
-             + pbr_ibl(N, V, in.color, u.roughness, u.metallic);
+    var color = shadow * pbr_direct(N, V, L, albedo, rough, u.metallic, u.light_intensity)
+             + pbr_ibl(N, V, albedo, rough, u.metallic);
 
     // Light 2
     if u.light2_intensity > 0.0 {
         let L2 = normalize(vec3<f32>(u.light2_dir_xy, u.light2_dir_z));
-        color += pbr_direct(N, V, L2, in.color, u.roughness, u.metallic, u.light2_intensity);
+        color += pbr_direct(N, V, L2, albedo, rough, u.metallic, u.light2_intensity);
     }
 
     // Fresnel edge darkening (cartoon silhouette)
@@ -172,8 +192,8 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     let edge_dark = clamp(pow(1.0 - nv, 6.0) * 0.55 * u.edge_strength, 0.0, 1.0);
     color *= 1.0 - edge_dark;
 
-    // Residue highlight: orange rim glow
-    if u.picked_residue_id != 0u && in.residue_id == u.picked_residue_id {
+    // Residue highlight: orange rim glow (front faces only)
+    if !is_back && u.picked_residue_id != 0u && in.residue_id == u.picked_residue_id {
         let rim = pow(1.0 - nv, 3.0);
         color += rim * vec3<f32>(1.0, 0.6, 0.0) * 1.5;
     }

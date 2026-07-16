@@ -97,7 +97,6 @@ impl CylinderInstance {
 }
 
 /// Generate a unit cylinder along Y axis (y ∈ [-0.5, 0.5], radius = 1).
-/// No end caps (they are hidden inside atom spheres).
 pub fn gen_cylinder(segments: u32) -> (Vec<Vertex>, Vec<u32>) {
     let n = segments as usize;
     let mut vertices = Vec::with_capacity(n * 2);
@@ -116,8 +115,9 @@ pub fn gen_cylinder(segments: u32) -> (Vec<Vertex>, Vec<u32>) {
         let i1 = i * 2 + 1;
         let i2 = ((i + 1) % n as u32) * 2;
         let i3 = ((i + 1) % n as u32) * 2 + 1;
-        // two triangles per quad
-        indices.extend_from_slice(&[i0, i2, i1, i1, i2, i3]);
+        // CCW winding for outward-facing triangles (so back-face culling keeps
+        // the near wall, giving correct surface depth).
+        indices.extend_from_slice(&[i0, i1, i2, i1, i3, i2]);
     }
 
     (vertices, indices)

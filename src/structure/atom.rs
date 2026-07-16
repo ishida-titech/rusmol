@@ -204,6 +204,7 @@ impl Structure {
         self.polymer_residue_keys = compute_polymer_keys(&self.atoms);
     }
 
+    #[allow(dead_code)]
     pub fn centroid(&self) -> Vec3 {
         if self.atoms.is_empty() {
             return Vec3::ZERO;

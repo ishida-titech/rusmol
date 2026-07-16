@@ -23,6 +23,7 @@ rayon = "1"
 egui = "0.31"
 egui-wgpu = "0.31"
 egui-winit = "0.31"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 opt-level = 3

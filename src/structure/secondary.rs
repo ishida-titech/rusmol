@@ -1,4 +1,5 @@
 use super::atom::{Atom, SecondaryStructure};
+use super::dssp::assign_ss_dssp;
 
 pub struct SsRange {
     pub chain: char,
@@ -11,7 +12,11 @@ pub struct SsRange {
 
 /// Assign secondary structure to each atom.
 /// The returned Vec has the same length as `atoms`.
+/// When `ranges` is empty (e.g. PDBQT), falls back to DSSP hydrogen-bond analysis.
 pub fn assign_ss(atoms: &[Atom], ranges: &[SsRange]) -> Vec<SecondaryStructure> {
+    if ranges.is_empty() {
+        return assign_ss_dssp(atoms);
+    }
     atoms
         .iter()
         .map(|atom| {

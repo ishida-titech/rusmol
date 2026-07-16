@@ -8,7 +8,7 @@ use rustyline::{Context, Editor, Helper};
 use winit::event_loop::EventLoopProxy;
 
 use super::parser::parse_command;
-use super::{Command, CommandResponse};
+use super::{Command, CommandResponse, TraceAction};
 
 // ── Tab-completion helper ────────────────────────────────────────────────────
 
@@ -34,12 +34,13 @@ impl Validator for RusmolHelper {}
 /// Top-level command names (canonical forms only — no short aliases to avoid noise).
 const COMMANDS: &[&str] = &[
     "load", "select", "show", "hide", "color", "enable", "disable", "delete",
-    "zoom", "reset", "bg", "light", "light2", "set", "get", "help", "quit",
+    "zoom", "reset", "bg", "light", "light2", "set", "get", "docktrace",
+    "help", "quit",
 ];
 
 /// Representation names for show/hide.
 const REPS: &[&str] = &[
-    "ball_stick", "backbone", "ribbon", "surface", "lines",
+    "ball_stick", "stick", "backbone", "ribbon", "surface", "lines",
 ];
 
 /// Color names for `color` and `bg`.
@@ -52,7 +53,7 @@ const COLORS: &[&str] = &[
 
 /// Setting names for `set` / `get`.
 const SETTINGS: &[&str] = &[
-    "transparency", "surface_type", "surface_quality", "surface_color",
+    "transparency", "surface_type", "surface_quality", "surface_smooth", "surface_color",
     "cartoon_color", "edge_strength", "roughness", "metallic",
     "ibl_intensity", "shadow_strength", "bloom_threshold", "bloom_intensity",
     "light_intensity", "light_elevation", "light_azimuth",
@@ -204,14 +205,65 @@ pub fn run_prompt(cmd_tx: Sender<Command>, resp_rx: Receiver<CommandResponse>, p
     };
     rl.set_helper(Some(RusmolHelper::new()));
 
+    let mut trace_mode = false;
+    let mut trace_step = 0usize;
+    let mut trace_total = 0usize;
+
     loop {
-        match rl.readline("rusmol> ") {
+        let prompt = if trace_mode {
+            format!("[trace {}/{}] n/r/q> ", trace_step + 1, trace_total)
+        } else {
+            "RusMol> ".to_string()
+        };
+
+        match rl.readline(&prompt) {
             Ok(line) => {
                 let line = line.trim().to_string();
-                if line.is_empty() {
+                if line.is_empty() && !trace_mode {
                     continue;
                 }
-                let _ = rl.add_history_entry(&line);
+                if !line.is_empty() {
+                    let _ = rl.add_history_entry(&line);
+                }
+
+                if trace_mode {
+                    let cmd = match line.as_str() {
+                        "" | "n" | "next" => Some(Command::DockTraceNav(TraceAction::Next)),
+                        "r" | "prev" => Some(Command::DockTraceNav(TraceAction::Prev)),
+                        "q" | "quit" => Some(Command::DockTraceNav(TraceAction::Quit)),
+                        s if s.parse::<usize>().is_ok() => {
+                            let row = s.parse::<usize>().unwrap();
+                            Some(Command::DockTraceNav(TraceAction::GoTo(row)))
+                        }
+                        _ => {
+                            eprintln!("trace mode: Enter/n=next, r=prev, <number>=goto row, q=quit");
+                            continue;
+                        }
+                    };
+                    if let Some(cmd) = cmd {
+                        if cmd_tx.send(cmd).is_err() { break; }
+                        let _ = proxy.send_event(());
+                        match resp_rx.recv() {
+                            Ok(CommandResponse::DockTraceStep { step, total, info }) => {
+                                trace_step = step;
+                                trace_total = total;
+                                println!("{info}");
+                            }
+                            Ok(CommandResponse::DockTraceExit) => {
+                                trace_mode = false;
+                                println!("dock trace mode ended");
+                            }
+                            Ok(CommandResponse::Ok(msg)) => {
+                                if !msg.is_empty() { println!("{msg}"); }
+                            }
+                            Ok(CommandResponse::Error(msg)) => {
+                                eprintln!("Error: {msg}");
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    continue;
+                }
 
                 match parse_command(&line) {
                     Ok(cmd) => {
@@ -229,6 +281,15 @@ pub fn run_prompt(cmd_tx: Sender<Command>, resp_rx: Receiver<CommandResponse>, p
                             }
                             Ok(CommandResponse::Error(msg)) => {
                                 eprintln!("Error: {msg}");
+                            }
+                            Ok(CommandResponse::DockTraceStep { step, total, info }) => {
+                                trace_mode = true;
+                                trace_step = step;
+                                trace_total = total;
+                                println!("{info}");
+                            }
+                            Ok(CommandResponse::DockTraceExit) => {
+                                trace_mode = false;
                             }
                             Err(_) => break, // main thread gone
                         }

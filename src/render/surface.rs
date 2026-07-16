@@ -4,7 +4,7 @@ use crate::structure::atom::Structure;
 use crate::util::color::vdw_radius;
 use glam::Vec3;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 const SIGMA: f32 = 1.2;
 const THRESHOLD: f32 = 0.5;
@@ -13,6 +13,12 @@ const CUTOFF: f32 = 5.0;
 
 /// Probe radius for SES (water molecule radius).
 const PROBE_RADIUS: f32 = 1.4;
+
+/// Taubin mesh-smoothing parameters (removes marching-cubes grid quantization
+/// bumps without the volumetric shrinkage of plain Laplacian smoothing).
+/// The iteration count is passed in at runtime (`set surface_smooth`).
+const SMOOTH_LAMBDA: f32 = 0.5;
+const SMOOTH_MU: f32 = -0.53;
 
 /// Surface computation method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,6 +606,7 @@ pub fn build_surface(
     atom_rep_show: &[u8],
     surface_type: SurfaceType,
     step: f32,
+    smooth_iters: usize,
     vertices: &mut Vec<RibbonVertex>,
     indices: &mut Vec<u32>,
 ) {
@@ -607,6 +614,9 @@ pub fn build_surface(
     let mut chain_atoms: HashMap<char, Vec<(Vec3, [f32; 3], u32, f32)>> = HashMap::new();
     for (i, a) in structure.atoms.iter().enumerate() {
         if atom_rep_show.get(i).copied().unwrap_or(0) & REP_SURFACE == 0 {
+            continue;
+        }
+        if !structure.is_polymer_atom(a) {
             continue;
         }
         let r = vdw_radius(&a.element);
@@ -626,7 +636,7 @@ pub fn build_surface(
 
     for chain_id in chains {
         let atoms_data = &chain_atoms[&chain_id];
-        build_surface_for_atoms(atoms_data, surface_type, step, vertices, indices);
+        build_surface_for_atoms(atoms_data, surface_type, step, smooth_iters, vertices, indices);
     }
 }
 
@@ -635,6 +645,7 @@ fn build_surface_for_atoms(
     atoms_data: &[(Vec3, [f32; 3], u32, f32)],
     surface_type: SurfaceType,
     step: f32,
+    smooth_iters: usize,
     vertices: &mut Vec<RibbonVertex>,
     indices: &mut Vec<u32>,
 ) {
@@ -966,9 +977,20 @@ fn build_surface_for_atoms(
                     next += 1;
                 }
             }
-            let final_idxs: Vec<u32> = kept_idxs
+            // Local (0-based) triangle indices for smoothing.
+            let local_idxs: Vec<u32> = kept_idxs
                 .iter()
-                .map(|&i| welded_remap[i as usize] + vert_start as u32)
+                .map(|&i| welded_remap[i as usize])
+                .collect();
+
+            // ── Step 5: Taubin smoothing (removes grid-quantization bumps) ────
+            if smooth_iters > 0 {
+                smooth_surface_mesh(&mut final_verts, &local_idxs, smooth_iters);
+            }
+
+            let final_idxs: Vec<u32> = local_idxs
+                .iter()
+                .map(|&i| i + vert_start as u32)
                 .collect();
 
             // Write back
@@ -1019,5 +1041,82 @@ fn build_surface_for_atoms(
         }
         v.residue_id = best_resid;
     });
+}
+
+/// Taubin (λ/μ) smoothing of a welded surface mesh, followed by normal
+/// recomputation. Positions are relaxed toward the neighbour average with an
+/// alternating shrink (λ > 0) / un-shrink (μ < 0) step so the mesh keeps its
+/// volume while grid-quantization bumps are removed.
+///
+/// `indices` are triangle indices in the local `verts` index space. The
+/// recomputed geometric normal is re-oriented to agree with the original
+/// gradient-based normal, so it stays correct regardless of triangle winding.
+fn smooth_surface_mesh(verts: &mut [RibbonVertex], indices: &[u32], iterations: usize) {
+    let n = verts.len();
+    if n == 0 || indices.len() < 3 {
+        return;
+    }
+
+    // ── Vertex adjacency (unique undirected edges) ──────────────────────────
+    let mut adj: Vec<Vec<u32>> = vec![Vec::new(); n];
+    let mut seen: HashSet<(u32, u32)> = HashSet::new();
+    for tri in indices.chunks(3) {
+        for &(a, b) in &[(tri[0], tri[1]), (tri[1], tri[2]), (tri[2], tri[0])] {
+            let key = if a < b { (a, b) } else { (b, a) };
+            if seen.insert(key) {
+                adj[a as usize].push(b);
+                adj[b as usize].push(a);
+            }
+        }
+    }
+
+    let mut pos: Vec<Vec3> = verts.iter().map(|v| Vec3::from(v.position)).collect();
+    let mut tmp = pos.clone();
+
+    // One Laplacian pass with the given relaxation factor: src → dst.
+    let pass = |factor: f32, src: &[Vec3], dst: &mut [Vec3], adj: &[Vec<u32>]| {
+        dst.par_iter_mut().enumerate().for_each(|(i, out)| {
+            let nbrs = &adj[i];
+            if nbrs.is_empty() {
+                *out = src[i];
+                return;
+            }
+            let mut avg = Vec3::ZERO;
+            for &nb in nbrs {
+                avg += src[nb as usize];
+            }
+            avg /= nbrs.len() as f32;
+            *out = src[i] + factor * (avg - src[i]);
+        });
+    };
+
+    for _ in 0..iterations {
+        pass(SMOOTH_LAMBDA, &pos, &mut tmp, &adj);
+        pass(SMOOTH_MU, &tmp, &mut pos, &adj);
+    }
+
+    // ── Recompute normals (area-weighted face normals) ──────────────────────
+    let mut normals = vec![Vec3::ZERO; n];
+    for tri in indices.chunks(3) {
+        let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        let fnrm = (pos[b] - pos[a]).cross(pos[c] - pos[a]);
+        normals[a] += fnrm;
+        normals[b] += fnrm;
+        normals[c] += fnrm;
+    }
+
+    for i in 0..n {
+        verts[i].position = pos[i].to_array();
+        let len = normals[i].length();
+        if len > 1e-8 {
+            let orig = Vec3::from(verts[i].normal);
+            let mut nrm = normals[i] / len;
+            // Keep the gradient-derived orientation (winding may be inconsistent).
+            if nrm.dot(orig) < 0.0 {
+                nrm = -nrm;
+            }
+            verts[i].normal = nrm.to_array();
+        }
+    }
 }
 

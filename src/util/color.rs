@@ -21,6 +21,15 @@ pub fn cpk_color(element: &str) -> [f32; 3] {
     }
 }
 
+/// CPK colors darkened by a fixed factor. Used for the protein side of the
+/// Binding Site view so it stays element-colored but reads as clearly distinct
+/// from the full-brightness CPK ligand.
+pub fn cpk_dark(element: &str) -> [f32; 3] {
+    const DARKEN: f32 = 0.25;
+    let [r, g, b] = cpk_color(element);
+    [r * DARKEN, g * DARKEN, b * DARKEN]
+}
+
 /// Van der Waals radius in Angstroms
 pub fn vdw_radius(element: &str) -> f32 {
     match element.trim().to_uppercase().as_str() {

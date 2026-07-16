@@ -24,6 +24,14 @@ pub enum ColorSpec {
     BFactor,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum TraceAction {
+    Next,
+    Prev,
+    GoTo(usize),
+    Quit,
+}
+
 #[derive(Debug)]
 pub enum Command {
     Load { path: PathBuf, name: Option<String> },
@@ -49,6 +57,12 @@ pub enum Command {
     SetColor { rep: String, color: Option<[f32; 3]>, sel: Option<String> },
     /// `get [name]` — show current parameter value(s)
     Get { name: Option<String> },
+    /// Save a screenshot as PNG: `png <filename>`
+    Png { path: PathBuf },
+    /// Load dock trace: `docktrace <trace_file>, <ligand_pdbqt>`
+    DockTrace { trace_path: PathBuf, ligand_path: PathBuf },
+    /// Navigate within dock trace mode
+    DockTraceNav(TraceAction),
     Help,
     Quit,
 }
@@ -57,4 +71,6 @@ pub enum Command {
 pub enum CommandResponse {
     Ok(String),
     Error(String),
+    DockTraceStep { step: usize, total: usize, info: String },
+    DockTraceExit,
 }

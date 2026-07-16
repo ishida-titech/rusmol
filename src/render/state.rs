@@ -10,8 +10,9 @@ use crate::render::picker::Picker;
 use crate::render::ribbon::{build_ribbon, residues_consecutive, RibbonGap, RibbonVertex};
 use crate::render::uniform::ShadowUniforms;
 use crate::render::surface::build_surface;
+use crate::structure::rings::detect_aromatic_rings;
 use crate::render::uniform::Uniforms;
-use crate::scene::object::{RepresentationType, REP_BACKBONE, REP_BALL_STICK, REP_LINES, REP_RIBBON, REP_SURFACE};
+use crate::scene::object::{RepresentationType, REP_BACKBONE, REP_BALL_STICK, REP_LINES, REP_RIBBON, REP_STICK, REP_SURFACE};
 use crate::scene::{AtomRef, Scene};
 use crate::util::color::vdw_radius;
 
@@ -24,10 +25,30 @@ pub enum PickResult {
     Residue(crate::scene::AtomRef),
 }
 
-const BOND_RADIUS: f32 = 0.15;
+const BOND_RADIUS: f32 = 0.18;
+/// Stick representation is slightly chunkier than ball-and-stick bonds.
+const STICK_RADIUS: f32 = BOND_RADIUS * 2.5;
 const BACKBONE_TUBE_RADIUS: f32 = 0.30;
 const BACKBONE_JOINT_RADIUS: f32 = 0.36;
 const SHADOW_MAP_SIZE: u32 = 2048;
+
+const AROMATIC_RING_RADIUS: f32 = 0.04;
+const AROMATIC_RING_SEGMENTS: usize = 24;
+const AROMATIC_RING_SCALE: f32 = 0.58;
+
+/// Pocket-surface clip: a surface triangle is kept when the average of its
+/// vertices' `outward_normal · dir_to_nearest_ligand` exceeds this threshold.
+/// Negative so the pocket wall and its rim are kept generously; the far side
+/// (normals pointing away) is dropped, then isolated fragments are pruned.
+const SURFACE_POCKET_FACING: f32 = -0.35;
+
+/// After the pocket clip, drop connected mesh components whose triangle count
+/// is below this fraction of the largest component (removes stray back-side bits).
+const SURFACE_POCKET_MIN_COMPONENT: f32 = 0.2;
+
+/// Boundary loops with at most this many edges are treated as holes and filled;
+/// the single largest loop (the intended open rim) is always left open.
+const SURFACE_HOLE_MAX_EDGES: usize = 80;
 
 const DASH_RADIUS: f32 = 0.08;
 const DASH_LEN: f32 = 0.6;
@@ -73,6 +94,14 @@ pub struct RenderState {
     sphere_pipeline: wgpu::RenderPipeline,
     sphere_instances: Option<wgpu::Buffer>,
     sphere_instance_count: u32,
+
+    // ── Ligand overlay (drawn after surface so ligands are always opaque) ────
+    ligand_sphere_pipeline: wgpu::RenderPipeline,
+    ligand_cylinder_pipeline: wgpu::RenderPipeline,
+    ligand_sphere_instances: Option<wgpu::Buffer>,
+    ligand_sphere_instance_count: u32,
+    ligand_cylinder_instances: Option<wgpu::Buffer>,
+    ligand_cylinder_instance_count: u32,
 
     // ── Cylinder pipeline ────────────────────────────────────────────────────
     cylinder_pipeline: wgpu::RenderPipeline,
@@ -195,6 +224,13 @@ pub struct RenderState {
     pub surface_type: crate::render::surface::SurfaceType,
     /// Surface grid step size in Å (default 0.5, smaller = finer mesh). Set via `set surface_quality`.
     pub surface_quality: f32,
+    /// Taubin smoothing iterations for the surface mesh (0 = off). Set via `set surface_smooth`.
+    pub surface_smooth: u32,
+    /// When true (Pocket Surface preset), keep only the surface facing the ligand.
+    pub surface_clip_to_ligand: bool,
+    /// Ligand–protein hydrogen bonds (heavy-atom endpoint pairs) drawn as dashed
+    /// lines in the Binding Site view. Empty in all other presets.
+    pub hbond_segments: Vec<(glam::Vec3, glam::Vec3)>,
 
     // ── Shadow mapping ───────────────────────────────────────────────────────
     shadow_map_view: wgpu::TextureView,
@@ -223,6 +259,9 @@ pub struct RenderState {
 
     /// egui overlay renderer.
     pub egui_renderer: egui_wgpu::Renderer,
+
+    /// When set, the next render will capture the post-composite output to this path.
+    pub pending_screenshot: Option<std::path::PathBuf>,
 }
 
 impl RenderState {
@@ -519,6 +558,53 @@ impl RenderState {
         });
         let cylinder_index_count = c_indices.len() as u32;
 
+        // ── Ligand overlay pipelines (single-sample, drawn after surface) ────
+        let ligand_sphere_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("LigandSphereImpostorPipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &sphere_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[SphereInstance::impostor_desc()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &sphere_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: true,
+                depth_compare: wgpu::CompareFunction::Less,
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+            cache: None,
+        });
+        let ligand_cylinder_pipeline = build_pipeline(
+            &device,
+            &pipeline_layout,
+            &cyl_shader,
+            "vs_main",
+            "fs_main",
+            &[Vertex::desc(), CylinderInstance::desc()],
+            wgpu::TextureFormat::Rgba16Float,
+            1,
+        );
+
         // ── Ribbon pipeline (Rgba16Float, MSAA×4) ────────────────────────────
         let ribbon_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("RibbonShader"),
@@ -648,7 +734,7 @@ impl RenderState {
                 depth_write_enabled: true,
                 depth_compare: wgpu::CompareFunction::Less,
                 stencil: Default::default(),
-                bias: wgpu::DepthBiasState { constant: 2, slope_scale: 2.0, clamp: 0.0 },
+                bias: Default::default(),
             }),
             multisample: wgpu::MultisampleState::default(),
             multiview: None,
@@ -1210,6 +1296,12 @@ impl RenderState {
             sphere_pipeline,
             sphere_instances: None,
             sphere_instance_count: 0,
+            ligand_sphere_pipeline,
+            ligand_cylinder_pipeline,
+            ligand_sphere_instances: None,
+            ligand_sphere_instance_count: 0,
+            ligand_cylinder_instances: None,
+            ligand_cylinder_instance_count: 0,
             cylinder_pipeline,
             cylinder_vb,
             cylinder_ib,
@@ -1274,7 +1366,10 @@ impl RenderState {
             bloom_threshold: 1.0,
             bloom_intensity: 0.0,
             surface_type: crate::render::surface::SurfaceType::Ses,
-            surface_quality: 0.5,
+            surface_quality: 0.35,
+            surface_smooth: 6,
+            surface_clip_to_ligand: false,
+            hbond_segments: Vec::new(),
             shadow_map_view,
             shadow_uniform_buffer,
             shadow_uniform_bg,
@@ -1297,6 +1392,7 @@ impl RenderState {
             bloom_b_tex,
             bloom_b_view,
             egui_renderer,
+            pending_screenshot: None,
         })
     }
 
@@ -1366,266 +1462,459 @@ impl RenderState {
         self.picker.resize(&self.device, width, height);
     }
 
-    /// Rebuild all geometry buffers from scene data.
-    pub fn upload_scene(&mut self, scene: &Scene) {
+    /// Rebuild GPU geometry buffers from scene data.
+    ///
+    /// Only the parts indicated by `dirty` are rebuilt:
+    /// - `ATOMS` / `RIBBON`: spheres, cylinders, backbone, lines, ribbon mesh, ghost spheres
+    /// - `SURFACE`: surface mesh (most expensive)
+    pub fn upload_scene(&mut self, scene: &Scene, dirty: crate::scene::SceneDirty) {
+        use crate::scene::SceneDirty;
         let _upload_t0 = std::time::Instant::now();
-        let mut spheres:        Vec<SphereInstance>   = Vec::new();
-        let mut sphere_map:     Vec<AtomRef>          = Vec::new();
-        let mut cylinders:      Vec<CylinderInstance> = Vec::new();
-        let mut ribbon_verts:   Vec<RibbonVertex>     = Vec::new();
-        let mut ribbon_idxs:    Vec<u32>              = Vec::new();
-        let mut surface_verts:  Vec<RibbonVertex>     = Vec::new();
-        let mut surface_idxs:   Vec<u32>              = Vec::new();
 
+        let need_atoms_ribbon = dirty.contains(SceneDirty::ATOMS) || dirty.contains(SceneDirty::RIBBON);
+        let need_surface = dirty.contains(SceneDirty::SURFACE);
+
+        // Residue IDs are needed by both ribbon and surface builds.
         self.residue_ids_cache.clear();
         for (obj_name, obj) in scene.iter() {
-            if !obj.is_visible() {
-                continue;
-            }
-            let atoms  = &obj.structure.atoms;
-            let colors = &obj.atom_colors;
+            if !obj.is_visible() { continue; }
             let residue_ids = compute_residue_ids(&obj.structure);
             self.residue_ids_cache.insert(obj_name.clone(), residue_ids);
+        }
 
-            // ── Ball-and-stick ────────────────────────────────────────────────
-            for (i, atom) in atoms.iter().enumerate() {
-                if obj.atom_rep_show.get(i).copied().unwrap_or(0) & REP_BALL_STICK == 0 {
-                    continue;
-                }
-                let is_water = atom.is_hetatm
-                    && matches!(atom.residue.name.as_str(), "HOH" | "WAT" | "DOD");
-                let is_ligand = atom.is_hetatm && !is_water;
-                let color  = colors[i];
-                let radius = vdw_radius(&atom.element) * if is_water { 0.14 } else { 0.32 };
-                let edge_boost = if is_ligand { 1.0 } else { 0.0 };
-                sphere_map.push((obj_name.clone(), i));
-                spheres.push(SphereInstance { position: atom.position.to_array(), radius, color, edge_boost });
-            }
-            for bond in &obj.structure.bonds {
-                let (a1, a2) = (bond.atom1, bond.atom2);
-                if a1 >= atoms.len() || a2 >= atoms.len() { continue; }
-                let f1 = obj.atom_rep_show.get(a1).copied().unwrap_or(0);
-                let f2 = obj.atom_rep_show.get(a2).copied().unwrap_or(0);
-                if f1 & REP_BALL_STICK == 0 || f2 & REP_BALL_STICK == 0 { continue; }
-                // Skip cross-category bonds (e.g. CONECT between protein and ligand)
-                if atoms[a1].is_hetatm != atoms[a2].is_hetatm {
-                    let same_residue = atoms[a1].residue.chain == atoms[a2].residue.chain
-                        && atoms[a1].residue.seq_num == atoms[a2].residue.seq_num
-                        && atoms[a1].residue.ins_code == atoms[a2].residue.ins_code;
-                    if !same_residue { continue; }
-                }
-                let p1  = atoms[a1].position.to_array();
-                let p2  = atoms[a2].position.to_array();
-                let mid = [(p1[0]+p2[0])*0.5, (p1[1]+p2[1])*0.5, (p1[2]+p2[2])*0.5];
-                let is_ligand_a1 = atoms[a1].is_hetatm && !matches!(atoms[a1].residue.name.as_str(), "HOH" | "WAT" | "DOD");
-                let is_ligand_a2 = atoms[a2].is_hetatm && !matches!(atoms[a2].residue.name.as_str(), "HOH" | "WAT" | "DOD");
-                let eb1 = if is_ligand_a1 { 1.0 } else { 0.0 };
-                let eb2 = if is_ligand_a2 { 1.0 } else { 0.0 };
-                cylinders.push(CylinderInstance::new(p1,  mid, BOND_RADIUS, colors[a1], eb1));
-                cylinders.push(CylinderInstance::new(mid, p2,  BOND_RADIUS, colors[a2], eb2));
-            }
+        // ── Atoms + Ribbon (share cylinder buffer via ribbon gap lines) ─────
+        if need_atoms_ribbon {
+            let mut spheres:      Vec<SphereInstance>   = Vec::new();
+            let mut sphere_map:   Vec<AtomRef>          = Vec::new();
+            let mut cylinders:    Vec<CylinderInstance> = Vec::new();
+            let mut ligand_spheres:   Vec<SphereInstance>   = Vec::new();
+            let mut ligand_cylinders: Vec<CylinderInstance> = Vec::new();
+            let mut ribbon_verts: Vec<RibbonVertex>     = Vec::new();
+            let mut ribbon_idxs:  Vec<u32>              = Vec::new();
 
-            // ── Ribbon ───────────────────────────────────────────────────────
-            if obj.has_representation(RepresentationType::Ribbon) {
-                let rids = self.residue_ids_cache.get(obj_name).map(|v| v.as_slice()).unwrap_or(&[]);
-                let verts_start = ribbon_verts.len();
-                let mut ribbon_gaps: Vec<RibbonGap> = Vec::new();
-                build_ribbon(&obj.structure, &obj.atom_colors, rids, &obj.atom_rep_show, &mut ribbon_verts, &mut ribbon_idxs, &mut ribbon_gaps);
-                if let Some(col) = obj.ribbon_color_override {
-                    for v in &mut ribbon_verts[verts_start..] {
-                        v.color = col;
-                    }
-                }
-                // Dashed lines for missing-residue gaps in ribbon
-                for gap in &ribbon_gaps {
-                    emit_dashed_cylinders(&mut cylinders, &gap.p1, &gap.p2, &gap.color1, &gap.color2);
-                }
-            }
+            for (obj_name, obj) in scene.iter() {
+                if !obj.is_visible() { continue; }
+                let atoms  = &obj.structure.atoms;
+                let colors = &obj.atom_colors;
 
-            // ── Surface ───────────────────────────────────────────────────────
-            if obj.has_representation(RepresentationType::Surface) {
-                let t0 = std::time::Instant::now();
-                let rids = self.residue_ids_cache.get(obj_name).map(|v| v.as_slice()).unwrap_or(&[]);
-                let verts_start = surface_verts.len();
-                build_surface(&obj.structure, &obj.atom_colors, rids, &obj.atom_rep_show, self.surface_type, self.surface_quality, &mut surface_verts, &mut surface_idxs);
-                if let Some(col) = obj.surface_color_override {
-                    for v in &mut surface_verts[verts_start..] {
-                        v.color = col;
-                    }
-                }
-                log::info!(
-                    "surface build '{}': {:.0} ms  ({} verts, {} tris)",
-                    obj_name,
-                    t0.elapsed().as_secs_f64() * 1000.0,
-                    surface_verts.len(),
-                    surface_idxs.len() / 3,
-                );
-            }
-
-            // ── Backbone (Cα trace) ───────────────────────────────────────────
-            if obj.has_representation(RepresentationType::Backbone) {
-                let mut ca_by_chain: HashMap<char, Vec<(i32, Option<char>, usize)>> =
-                    HashMap::new();
+                // ── Ball-and-stick ────────────────────────────────────────────
                 for (i, atom) in atoms.iter().enumerate() {
-                    if obj.atom_rep_show.get(i).copied().unwrap_or(0) & REP_BACKBONE == 0 { continue; }
-                    if atom.name.trim() == "CA" && !atom.is_hetatm {
-                        ca_by_chain
-                            .entry(atom.residue.chain)
-                            .or_default()
-                            .push((atom.residue.seq_num, atom.residue.ins_code, i));
+                    let flags = obj.atom_rep_show.get(i).copied().unwrap_or(0);
+                    if flags & (REP_BALL_STICK | REP_STICK) == 0 {
+                        continue;
+                    }
+                    // Stick: uniform bond-radius spheres round the joints into a
+                    // continuous rod. Ball-and-stick keeps van-der-Waals-scaled balls.
+                    let stick_only = flags & REP_BALL_STICK == 0;
+                    let is_water = atom.is_hetatm
+                        && matches!(atom.residue.name.as_str(), "HOH" | "WAT" | "DOD");
+                    let is_ligand = atom.is_hetatm && !is_water;
+                    let color  = colors[i];
+                    let radius = if stick_only {
+                        STICK_RADIUS
+                    } else {
+                        vdw_radius(&atom.element) * if is_water { 0.14 } else { 0.22 }
+                    };
+                    let edge_boost = if is_ligand { 1.0 } else { 0.0 };
+                    let inst = SphereInstance { position: atom.position.to_array(), radius, color, edge_boost };
+                    sphere_map.push((obj_name.clone(), i));
+                    if is_ligand {
+                        ligand_spheres.push(inst);
+                    } else {
+                        spheres.push(inst);
                     }
                 }
-                for chain_cas in ca_by_chain.values_mut() {
-                    chain_cas.sort_unstable_by_key(|&(seq, ins, _)| (seq, ins));
-                    for &(_, _, i) in chain_cas.iter() {
-                        sphere_map.push((obj_name.clone(), i));
-                        spheres.push(SphereInstance {
-                            position: atoms[i].position.to_array(),
-                            radius: BACKBONE_JOINT_RADIUS,
-                            color: colors[i],
-                            edge_boost: 0.0,
-                        });
+                for bond in &obj.structure.bonds {
+                    let (a1, a2) = (bond.atom1, bond.atom2);
+                    if a1 >= atoms.len() || a2 >= atoms.len() { continue; }
+                    let f1 = obj.atom_rep_show.get(a1).copied().unwrap_or(0);
+                    let f2 = obj.atom_rep_show.get(a2).copied().unwrap_or(0);
+                    let mask = REP_BALL_STICK | REP_STICK;
+                    if f1 & mask == 0 || f2 & mask == 0 { continue; }
+                    if atoms[a1].is_hetatm != atoms[a2].is_hetatm {
+                        let same_residue = atoms[a1].residue.chain == atoms[a2].residue.chain
+                            && atoms[a1].residue.seq_num == atoms[a2].residue.seq_num
+                            && atoms[a1].residue.ins_code == atoms[a2].residue.ins_code;
+                        if !same_residue { continue; }
                     }
-                    for window in chain_cas.windows(2) {
-                        let (seq1, _, i1) = window[0];
-                        let (seq2, _, i2) = window[1];
-                        let p1  = atoms[i1].position.to_array();
-                        let p2  = atoms[i2].position.to_array();
-                        if residues_consecutive(seq1, seq2) {
-                            let mid = [(p1[0]+p2[0])*0.5, (p1[1]+p2[1])*0.5, (p1[2]+p2[2])*0.5];
-                            cylinders.push(CylinderInstance::new(p1,  mid, BACKBONE_TUBE_RADIUS, colors[i1], 0.0));
-                            cylinders.push(CylinderInstance::new(mid, p2,  BACKBONE_TUBE_RADIUS, colors[i2], 0.0));
-                        } else {
-                            emit_dashed_cylinders(&mut cylinders, &p1, &p2, &colors[i1], &colors[i2]);
+                    let p1  = atoms[a1].position;
+                    let p2  = atoms[a2].position;
+                    let mid = (p1 + p2) * 0.5;
+                    let is_ligand_a1 = atoms[a1].is_hetatm && !matches!(atoms[a1].residue.name.as_str(), "HOH" | "WAT" | "DOD");
+                    let is_ligand_a2 = atoms[a2].is_hetatm && !matches!(atoms[a2].residue.name.as_str(), "HOH" | "WAT" | "DOD");
+                    let eb1 = if is_ligand_a1 { 1.0 } else { 0.0 };
+                    let eb2 = if is_ligand_a2 { 1.0 } else { 0.0 };
+                    // Stick bonds (both atoms stick-only, no ball) are thicker.
+                    let stick_bond = (f1 & REP_BALL_STICK == 0) && (f2 & REP_BALL_STICK == 0);
+                    let radius = if stick_bond { STICK_RADIUS } else { BOND_RADIUS };
+                    let c1 = CylinderInstance::new(p1.to_array(), mid.to_array(), radius, colors[a1], eb1);
+                    let c2 = CylinderInstance::new(mid.to_array(), p2.to_array(), radius, colors[a2], eb2);
+                    if is_ligand_a1 || is_ligand_a2 {
+                        ligand_cylinders.push(c1);
+                        ligand_cylinders.push(c2);
+                    } else {
+                        cylinders.push(c1);
+                        cylinders.push(c2);
+                    }
+                }
+
+                // ── Aromatic ring indicators (HETATM ligands only, dashed) ─────
+                if obj.has_representation(RepresentationType::BallAndStick)
+                    && atoms.iter().any(|a| a.is_hetatm)
+                {
+                    let rings = detect_aromatic_rings(&obj.structure);
+                    for ring in &rings {
+                        if !ring.atom_indices.iter().all(|&i| atoms[i].is_hetatm) {
+                            continue;
+                        }
+                        let avg_color = {
+                            let mut c = [0.0f32; 3];
+                            let n = ring.atom_indices.len() as f32;
+                            for &idx in &ring.atom_indices {
+                                let ac = colors[idx];
+                                c[0] += ac[0]; c[1] += ac[1]; c[2] += ac[2];
+                            }
+                            [c[0] / n, c[1] / n, c[2] / n]
+                        };
+                        // Circle radius scales with the ring size (avg distance
+                        // from atoms to center → smaller for 5-membered rings).
+                        let avg_dist = ring.atom_indices.iter()
+                            .map(|&i| (atoms[i].position - ring.center).length())
+                            .sum::<f32>() / ring.atom_indices.len() as f32;
+                        let r = avg_dist * AROMATIC_RING_SCALE;
+
+                        let u = ring.normal.cross(glam::Vec3::Y).normalize_or_zero();
+                        let u = if u.length_squared() < 0.5 {
+                            ring.normal.cross(glam::Vec3::X).normalize()
+                        } else { u };
+                        let v = ring.normal.cross(u).normalize();
+
+                        // Dashed circle: draw every other segment as a thin cylinder.
+                        for seg in 0..AROMATIC_RING_SEGMENTS {
+                            if seg % 2 != 0 { continue; }
+                            let a0 = std::f32::consts::TAU * seg as f32 / AROMATIC_RING_SEGMENTS as f32;
+                            let a1 = std::f32::consts::TAU * (seg + 1) as f32 / AROMATIC_RING_SEGMENTS as f32;
+                            let p0 = ring.center + u * (r * a0.cos()) + v * (r * a0.sin());
+                            let p1 = ring.center + u * (r * a1.cos()) + v * (r * a1.sin());
+                            ligand_cylinders.push(CylinderInstance::new(
+                                p0.to_array(), p1.to_array(),
+                                AROMATIC_RING_RADIUS, avg_color, 1.0,
+                            ));
                         }
                     }
                 }
-            }
-            // ── Lines (wire) ─────────────────────────────────────────────────
-            // Rendered as thin cylinders reusing the cylinder pipeline.
-            // Only bonds where both endpoints have REP_LINES are drawn.
-            const LINE_RADIUS: f32 = 0.04;
-            for bond in &obj.structure.bonds {
-                let (a1, a2) = (bond.atom1, bond.atom2);
-                if a1 >= atoms.len() || a2 >= atoms.len() { continue; }
-                let f1 = obj.atom_rep_show.get(a1).copied().unwrap_or(0);
-                let f2 = obj.atom_rep_show.get(a2).copied().unwrap_or(0);
-                if f1 & REP_LINES == 0 || f2 & REP_LINES == 0 { continue; }
-                // Skip cross-category bonds (e.g. CONECT between protein and ligand)
-                if atoms[a1].is_hetatm != atoms[a2].is_hetatm {
-                    let same_residue = atoms[a1].residue.chain == atoms[a2].residue.chain
-                        && atoms[a1].residue.seq_num == atoms[a2].residue.seq_num
-                        && atoms[a1].residue.ins_code == atoms[a2].residue.ins_code;
-                    if !same_residue { continue; }
-                }
-                let p1  = atoms[a1].position.to_array();
-                let p2  = atoms[a2].position.to_array();
-                let mid = [(p1[0]+p2[0])*0.5, (p1[1]+p2[1])*0.5, (p1[2]+p2[2])*0.5];
-                cylinders.push(CylinderInstance::new(p1,  mid, LINE_RADIUS, colors[a1], 0.0));
-                cylinders.push(CylinderInstance::new(mid, p2,  LINE_RADIUS, colors[a2], 0.0));
-            }
-        }
 
-        // ── Ghost spheres for Ribbon / Surface picking ────────────────────────
-        let mut ghost_spheres: Vec<SphereInstance> = Vec::new();
-        let mut ghost_map: Vec<AtomRef> = Vec::new();
-        for (obj_name, obj) in scene.iter() {
-            if !obj.is_visible() {
-                continue;
-            }
-            for (i, atom) in obj.structure.atoms.iter().enumerate() {
-                let flags = obj.atom_rep_show.get(i).copied().unwrap_or(0);
-                let atom_has_ribbon  = flags & REP_RIBBON  != 0;
-                let atom_has_surface = flags & REP_SURFACE != 0;
-                if !atom_has_ribbon && !atom_has_surface {
-                    continue;
-                }
-                let is_water = matches!(atom.residue.name.as_str(), "HOH" | "WAT" | "DOD");
-                if is_water {
-                    continue;
-                }
-                if atom_has_ribbon && !atom_has_surface {
-                    let name = atom.name.trim();
-                    if !matches!(name, "N" | "CA" | "C" | "O") {
-                        continue;
+                // ── Ribbon ───────────────────────────────────────────────────
+                if obj.has_representation(RepresentationType::Ribbon) {
+                    let rids = self.residue_ids_cache.get(obj_name).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let verts_start = ribbon_verts.len();
+                    let mut ribbon_gaps: Vec<RibbonGap> = Vec::new();
+                    build_ribbon(&obj.structure, &obj.atom_colors, rids, &obj.atom_rep_show, &mut ribbon_verts, &mut ribbon_idxs, &mut ribbon_gaps);
+                    if let Some(col) = obj.ribbon_color_override {
+                        for v in &mut ribbon_verts[verts_start..] {
+                            v.color = col;
+                        }
+                    }
+                    for gap in &ribbon_gaps {
+                        emit_dashed_cylinders(&mut cylinders, &gap.p1, &gap.p2, &gap.color1, &gap.color2);
                     }
                 }
-                ghost_map.push((obj_name.clone(), i));
-                ghost_spheres.push(SphereInstance {
-                    position: atom.position.to_array(),
-                    radius: vdw_radius(&atom.element),
-                    color: [0.0, 0.0, 0.0],
-                    edge_boost: 0.0,
-                });
+
+                // ── Backbone (Cα trace) ──────────────────────────────────────
+                if obj.has_representation(RepresentationType::Backbone) {
+                    let mut ca_by_chain: HashMap<char, Vec<(i32, Option<char>, usize)>> =
+                        HashMap::new();
+                    for (i, atom) in atoms.iter().enumerate() {
+                        if obj.atom_rep_show.get(i).copied().unwrap_or(0) & REP_BACKBONE == 0 { continue; }
+                        if atom.name.trim() == "CA" && !atom.is_hetatm {
+                            ca_by_chain
+                                .entry(atom.residue.chain)
+                                .or_default()
+                                .push((atom.residue.seq_num, atom.residue.ins_code, i));
+                        }
+                    }
+                    for chain_cas in ca_by_chain.values_mut() {
+                        chain_cas.sort_unstable_by_key(|&(seq, ins, _)| (seq, ins));
+                        for &(_, _, i) in chain_cas.iter() {
+                            sphere_map.push((obj_name.clone(), i));
+                            spheres.push(SphereInstance {
+                                position: atoms[i].position.to_array(),
+                                radius: BACKBONE_JOINT_RADIUS,
+                                color: colors[i],
+                                edge_boost: 0.0,
+                            });
+                        }
+                        for window in chain_cas.windows(2) {
+                            let (seq1, _, i1) = window[0];
+                            let (seq2, _, i2) = window[1];
+                            let p1  = atoms[i1].position.to_array();
+                            let p2  = atoms[i2].position.to_array();
+                            if residues_consecutive(seq1, seq2) {
+                                let mid = [(p1[0]+p2[0])*0.5, (p1[1]+p2[1])*0.5, (p1[2]+p2[2])*0.5];
+                                cylinders.push(CylinderInstance::new(p1,  mid, BACKBONE_TUBE_RADIUS, colors[i1], 0.0));
+                                cylinders.push(CylinderInstance::new(mid, p2,  BACKBONE_TUBE_RADIUS, colors[i2], 0.0));
+                            } else {
+                                emit_dashed_cylinders(&mut cylinders, &p1, &p2, &colors[i1], &colors[i2]);
+                            }
+                        }
+                    }
+                }
+
+                // ── Lines (wire) ─────────────────────────────────────────────
+                const LINE_RADIUS: f32 = 0.04;
+                for bond in &obj.structure.bonds {
+                    let (a1, a2) = (bond.atom1, bond.atom2);
+                    if a1 >= atoms.len() || a2 >= atoms.len() { continue; }
+                    let f1 = obj.atom_rep_show.get(a1).copied().unwrap_or(0);
+                    let f2 = obj.atom_rep_show.get(a2).copied().unwrap_or(0);
+                    if f1 & REP_LINES == 0 || f2 & REP_LINES == 0 { continue; }
+                    if atoms[a1].is_hetatm != atoms[a2].is_hetatm {
+                        let same_residue = atoms[a1].residue.chain == atoms[a2].residue.chain
+                            && atoms[a1].residue.seq_num == atoms[a2].residue.seq_num
+                            && atoms[a1].residue.ins_code == atoms[a2].residue.ins_code;
+                        if !same_residue { continue; }
+                    }
+                    let p1  = atoms[a1].position.to_array();
+                    let p2  = atoms[a2].position.to_array();
+                    let mid = [(p1[0]+p2[0])*0.5, (p1[1]+p2[1])*0.5, (p1[2]+p2[2])*0.5];
+                    cylinders.push(CylinderInstance::new(p1,  mid, LINE_RADIUS, colors[a1], 0.0));
+                    cylinders.push(CylinderInstance::new(mid, p2,  LINE_RADIUS, colors[a2], 0.0));
+                }
             }
+
+            // ── Ghost spheres for Ribbon / Surface picking ──────────────────
+            let mut ghost_spheres: Vec<SphereInstance> = Vec::new();
+            let mut ghost_map: Vec<AtomRef> = Vec::new();
+            for (obj_name, obj) in scene.iter() {
+                if !obj.is_visible() { continue; }
+                for (i, atom) in obj.structure.atoms.iter().enumerate() {
+                    let flags = obj.atom_rep_show.get(i).copied().unwrap_or(0);
+                    let atom_has_ribbon  = flags & REP_RIBBON  != 0;
+                    let atom_has_surface = flags & REP_SURFACE != 0;
+                    if !atom_has_ribbon && !atom_has_surface { continue; }
+                    if matches!(atom.residue.name.as_str(), "HOH" | "WAT" | "DOD") { continue; }
+                    if atom_has_ribbon && !atom_has_surface {
+                        let name = atom.name.trim();
+                        if !matches!(name, "N" | "CA" | "C" | "O") { continue; }
+                    }
+                    ghost_map.push((obj_name.clone(), i));
+                    ghost_spheres.push(SphereInstance {
+                        position: atom.position.to_array(),
+                        radius: vdw_radius(&atom.element),
+                        color: [0.0, 0.0, 0.0],
+                        edge_boost: 0.0,
+                    });
+                }
+            }
+
+            // ── Ligand–protein hydrogen bonds (dashed lines, Binding Site) ────
+            {
+                const HBOND_COLOR:  [f32; 3] = [0.98, 0.86, 0.25]; // soft yellow
+                const HBOND_RADIUS: f32 = 0.055;
+                const DASH:         f32 = 0.28;   // dash length; period = 2×DASH
+                for &(a, b) in &self.hbond_segments {
+                    let total = (b - a).length();
+                    if total < 1e-4 { continue; }
+                    let dir = (b - a) / total;
+                    let mut t = 0.0;
+                    while t < total {
+                        let p0 = a + dir * t;
+                        let p1 = a + dir * (t + DASH).min(total);
+                        cylinders.push(CylinderInstance::new(
+                            p0.to_array(), p1.to_array(), HBOND_RADIUS, HBOND_COLOR, 0.0,
+                        ));
+                        t += DASH * 2.0;          // skip the gap
+                    }
+                }
+            }
+
+            // Upload atom/ribbon/ghost buffers
+            self.ghost_instance_map = ghost_map;
+            self.ghost_instance_count = ghost_spheres.len() as u32;
+            self.ghost_instances = if ghost_spheres.is_empty() {
+                None
+            } else {
+                Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("GhostInstances"),
+                    contents: bytemuck::cast_slice(&ghost_spheres),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }))
+            };
+
+            self.sphere_instance_map = sphere_map;
+            self.sphere_instance_count = spheres.len() as u32;
+            self.sphere_instances = if spheres.is_empty() {
+                None
+            } else {
+                Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("SphereInstances"),
+                    contents: bytemuck::cast_slice(&spheres),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }))
+            };
+
+            self.cylinder_instance_count = cylinders.len() as u32;
+            self.cylinder_instances = if cylinders.is_empty() {
+                None
+            } else {
+                Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("CylInstances"),
+                    contents: bytemuck::cast_slice(&cylinders),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }))
+            };
+
+            self.ligand_sphere_instance_count = ligand_spheres.len() as u32;
+            self.ligand_sphere_instances = if ligand_spheres.is_empty() {
+                None
+            } else {
+                Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("LigandSphereInstances"),
+                    contents: bytemuck::cast_slice(&ligand_spheres),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }))
+            };
+
+            self.ligand_cylinder_instance_count = ligand_cylinders.len() as u32;
+            self.ligand_cylinder_instances = if ligand_cylinders.is_empty() {
+                None
+            } else {
+                Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("LigandCylInstances"),
+                    contents: bytemuck::cast_slice(&ligand_cylinders),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }))
+            };
+
+            self.ribbon_index_count = ribbon_idxs.len() as u32;
+            if ribbon_verts.is_empty() {
+                self.ribbon_vb = None;
+                self.ribbon_ib = None;
+            } else {
+                self.ribbon_vb = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("RibbonVB"),
+                    contents: bytemuck::cast_slice(&ribbon_verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }));
+                self.ribbon_ib = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("RibbonIB"),
+                    contents: bytemuck::cast_slice(&ribbon_idxs),
+                    usage: wgpu::BufferUsages::INDEX,
+                }));
+            }
+
+            log::info!(
+                "upload_scene [atoms+ribbon]: {:.0} ms  (spheres={}, cyls={}, ribbon_tris={})",
+                _upload_t0.elapsed().as_secs_f64() * 1000.0,
+                spheres.len(),
+                cylinders.len(),
+                ribbon_idxs.len() / 3,
+            );
         }
-        self.ghost_instance_map = ghost_map;
-        self.ghost_instance_count = ghost_spheres.len() as u32;
-        self.ghost_instances = if ghost_spheres.is_empty() {
-            None
-        } else {
-            Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("GhostInstances"),
-                contents: bytemuck::cast_slice(&ghost_spheres),
-                usage: wgpu::BufferUsages::VERTEX,
-            }))
-        };
 
-        self.sphere_instance_map = sphere_map;
-        self.sphere_instance_count = spheres.len() as u32;
-        self.sphere_instances = if spheres.is_empty() {
-            None
-        } else {
-            Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("SphereInstances"),
-                contents: bytemuck::cast_slice(&spheres),
-                usage: wgpu::BufferUsages::VERTEX,
-            }))
-        };
+        // ── Surface ─────────────────────────────────────────────────────────
+        if need_surface {
+            let _surf_t0 = std::time::Instant::now();
+            let mut surface_verts: Vec<RibbonVertex> = Vec::new();
+            let mut surface_idxs:  Vec<u32>          = Vec::new();
 
-        self.cylinder_instance_count = cylinders.len() as u32;
-        self.cylinder_instances = if cylinders.is_empty() {
-            None
-        } else {
-            Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("CylInstances"),
-                contents: bytemuck::cast_slice(&cylinders),
-                usage: wgpu::BufferUsages::VERTEX,
-            }))
-        };
+            for (obj_name, obj) in scene.iter() {
+                if !obj.is_visible() { continue; }
+                if obj.has_representation(RepresentationType::Surface) {
+                    let rids = self.residue_ids_cache.get(obj_name).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let verts_start = surface_verts.len();
+                    build_surface(&obj.structure, &obj.atom_colors, rids, &obj.atom_rep_show, self.surface_type, self.surface_quality, self.surface_smooth as usize, &mut surface_verts, &mut surface_idxs);
+                    if let Some(col) = obj.surface_color_override {
+                        for v in &mut surface_verts[verts_start..] {
+                            v.color = col;
+                        }
+                    }
+                    log::info!(
+                        "surface build '{}': {:.0} ms  ({} verts, {} tris)",
+                        obj_name,
+                        _surf_t0.elapsed().as_secs_f64() * 1000.0,
+                        surface_verts.len(),
+                        surface_idxs.len() / 3,
+                    );
+                }
+            }
 
-        self.ribbon_index_count = ribbon_idxs.len() as u32;
-        if ribbon_verts.is_empty() {
-            self.ribbon_vb = None;
-            self.ribbon_ib = None;
-        } else {
-            self.ribbon_vb = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("RibbonVB"),
-                contents: bytemuck::cast_slice(&ribbon_verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            }));
-            self.ribbon_ib = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("RibbonIB"),
-                contents: bytemuck::cast_slice(&ribbon_idxs),
-                usage: wgpu::BufferUsages::INDEX,
-            }));
-        }
+            // ── Pocket mode: keep only the ligand-facing side of the surface ──
+            // Collect ligand atoms (non-polymer, non-water) across the scene and
+            // drop every surface triangle whose outward normal points away from
+            // the nearest ligand atom, so only the pocket wall remains.
+            if self.surface_clip_to_ligand && !surface_verts.is_empty() {
+                let anchors: Vec<glam::Vec3> = scene
+                    .iter()
+                    .filter(|(_, o)| o.is_visible())
+                    .flat_map(|(_, o)| {
+                        o.structure.atoms.iter().filter(move |a| {
+                            !o.structure.is_polymer_atom(a)
+                                && !matches!(a.residue.name.as_str(), "HOH" | "WAT" | "DOD")
+                        })
+                    })
+                    .map(|a| a.position)
+                    .collect();
 
-        self.surface_index_count = surface_idxs.len() as u32;
-        if surface_verts.is_empty() {
-            self.surface_vb = None;
-            self.surface_ib = None;
-        } else {
-            self.surface_vb = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("SurfaceVB"),
-                contents: bytemuck::cast_slice(&surface_verts),
-                usage: wgpu::BufferUsages::VERTEX,
-            }));
-            self.surface_ib = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("SurfaceIB"),
-                contents: bytemuck::cast_slice(&surface_idxs),
-                usage: wgpu::BufferUsages::INDEX,
-            }));
+                if !anchors.is_empty() {
+                    // Per-vertex facing value: outward normal · direction to the
+                    // nearest ligand atom (+1 = straight at the ligand).
+                    let facing: Vec<f32> = surface_verts
+                        .iter()
+                        .map(|v| {
+                            let p = glam::Vec3::from(v.position);
+                            let n = glam::Vec3::from(v.normal);
+                            let nearest = anchors
+                                .iter()
+                                .copied()
+                                .min_by(|a, b| {
+                                    (*a - p).length_squared().total_cmp(&(*b - p).length_squared())
+                                })
+                                .unwrap();
+                            let dir = nearest - p;
+                            if dir.length_squared() < 1e-6 { 1.0 } else { n.dot(dir.normalize()) }
+                        })
+                        .collect();
+
+                    // Keep a triangle when its vertices face the ligand on average.
+                    let kept: Vec<u32> = surface_idxs
+                        .chunks(3)
+                        .filter(|t| {
+                            let avg = (facing[t[0] as usize]
+                                + facing[t[1] as usize]
+                                + facing[t[2] as usize]) / 3.0;
+                            avg > SURFACE_POCKET_FACING
+                        })
+                        .flat_map(|t| t.iter().copied())
+                        .collect();
+
+                    // Prune isolated fragments left behind (e.g. stray back-side bits).
+                    let pruned = drop_small_components(
+                        surface_verts.len(),
+                        kept,
+                        SURFACE_POCKET_MIN_COMPONENT,
+                    );
+                    // Fill the small holes the clip opened up in the pocket wall.
+                    surface_idxs = fill_mesh_holes(pruned, SURFACE_HOLE_MAX_EDGES);
+                }
+            }
+
+            self.surface_index_count = surface_idxs.len() as u32;
+            if surface_verts.is_empty() || surface_idxs.is_empty() {
+                self.surface_vb = None;
+                self.surface_ib = None;
+            } else {
+                self.surface_vb = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("SurfaceVB"),
+                    contents: bytemuck::cast_slice(&surface_verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                }));
+                self.surface_ib = Some(self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("SurfaceIB"),
+                    contents: bytemuck::cast_slice(&surface_idxs),
+                    usage: wgpu::BufferUsages::INDEX,
+                }));
+            }
         }
 
         // ── Compute scene bounding sphere for shadow mapping ────────────────
@@ -1655,12 +1944,9 @@ impl RenderState {
         }
 
         log::info!(
-            "upload_scene: {:.0} ms  (spheres={}, cyls={}, ribbon_tris={}, surface_tris={})",
+            "upload_scene total: {:.0} ms  (dirty={:?})",
             _upload_t0.elapsed().as_secs_f64() * 1000.0,
-            spheres.len(),
-            cylinders.len(),
-            ribbon_idxs.len() / 3,
-            surface_idxs.len() / 3,
+            dirty,
         );
     }
 
@@ -1874,6 +2160,29 @@ impl RenderState {
                 }
             }
 
+            // Shadow ligand spheres — the ligand does not *receive* shadows, but
+            // it still casts them onto the protein so it feels grounded in the pocket.
+            if let Some(buf) = &self.ligand_sphere_instances {
+                if self.ligand_sphere_instance_count > 0 {
+                    pass.set_pipeline(&self.shadow_impostor_pipeline);
+                    pass.set_bind_group(0, &self.shadow_uniform_bg, &[]);
+                    pass.set_vertex_buffer(0, buf.slice(..));
+                    pass.draw(0..6, 0..self.ligand_sphere_instance_count);
+                }
+            }
+
+            // Shadow ligand cylinders
+            if let Some(buf) = &self.ligand_cylinder_instances {
+                if self.ligand_cylinder_instance_count > 0 {
+                    pass.set_pipeline(&self.shadow_cylinder_pipeline);
+                    pass.set_bind_group(0, &self.shadow_uniform_bg, &[]);
+                    pass.set_vertex_buffer(0, self.cylinder_vb.slice(..));
+                    pass.set_vertex_buffer(1, buf.slice(..));
+                    pass.set_index_buffer(self.cylinder_ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..self.cylinder_index_count, 0, 0..self.ligand_cylinder_instance_count);
+                }
+            }
+
             // Shadow ribbon
             if let (Some(vb), Some(ib)) = (&self.ribbon_vb, &self.ribbon_ib) {
                 if self.ribbon_index_count > 0 {
@@ -1930,7 +2239,16 @@ impl RenderState {
                 ..Default::default()
             });
 
-            // Draw cylinders first (spheres will cover bond joints)
+            // Draw spheres first (impostor: 6 vertices per instance, no mesh buffer)
+            if let Some(buf) = &self.sphere_instances {
+                pass.set_pipeline(&self.sphere_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                pass.set_bind_group(1, &self.shadow_bg, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..6, 0..self.sphere_instance_count);
+            }
+
+            // Draw cylinders (depth test makes bonds visible through spheres at junctions)
             if let Some(buf) = &self.cylinder_instances {
                 pass.set_pipeline(&self.cylinder_pipeline);
                 pass.set_bind_group(0, &self.uniform_bind_group, &[]);
@@ -1949,15 +2267,6 @@ impl RenderState {
                 pass.set_vertex_buffer(0, vb.slice(..));
                 pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.ribbon_index_count, 0, 0..1);
-            }
-
-            // Draw spheres on top (impostor: 6 vertices per instance, no mesh buffer)
-            if let Some(buf) = &self.sphere_instances {
-                pass.set_pipeline(&self.sphere_pipeline);
-                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                pass.set_bind_group(1, &self.shadow_bg, &[]);
-                pass.set_vertex_buffer(0, buf.slice(..));
-                pass.draw(0..6, 0..self.sphere_instance_count);
             }
         }
 
@@ -1979,6 +2288,52 @@ impl RenderState {
             pass.set_pipeline(&self.depth_resolve_pipeline);
             pass.set_bind_group(0, &self.depth_resolve_bg, &[]);
             pass.draw(0..3, 0..1);
+        }
+
+        // ── Pass 2.5: Ligand overlay ─────────────────────────────────────────
+        // Drawn BEFORE the surface (against protein-only depth) so the ligand
+        // sits at its true depth: a semi-transparent surface then blends over it
+        // and it shows through — dimmed by the transparency, just like the ribbon —
+        // while the ligand still occludes the surface where it is in front.
+        if self.ligand_sphere_instances.is_some() || self.ligand_cylinder_instances.is_some() {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("LigandOverlayPass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.scene_color_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_single_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+
+            if let Some(buf) = &self.ligand_sphere_instances {
+                pass.set_pipeline(&self.ligand_sphere_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                pass.set_bind_group(1, &self.shadow_bg, &[]);
+                pass.set_vertex_buffer(0, buf.slice(..));
+                pass.draw(0..6, 0..self.ligand_sphere_instance_count);
+            }
+
+            if let Some(buf) = &self.ligand_cylinder_instances {
+                pass.set_pipeline(&self.ligand_cylinder_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                pass.set_bind_group(1, &self.shadow_bg, &[]);
+                pass.set_vertex_buffer(0, self.cylinder_vb.slice(..));
+                pass.set_vertex_buffer(1, buf.slice(..));
+                pass.set_index_buffer(self.cylinder_ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.cylinder_index_count, 0, 0..self.ligand_cylinder_instance_count);
+            }
         }
 
         // ── Pass 3: Surface alpha-blend pass ─────────────────────────────────
@@ -2143,6 +2498,75 @@ impl RenderState {
             pass.draw(0..3, 0..1);
         }
 
+        // ── Screenshot capture (between post-composite and egui) ─────────────
+        // Re-run the post-composite pass to a separate COPY_SRC texture so we
+        // capture the final image without egui UI overlay.
+        let screenshot_staging = if self.pending_screenshot.is_some() {
+            let w = self.config.width;
+            let h = self.config.height;
+            let capture_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("ScreenshotCapture"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: self.config.format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let capture_view = capture_tex.create_view(&Default::default());
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("ScreenshotPostPass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &capture_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.post_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                pass.set_bind_group(1, &self.post_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+
+            let bytes_per_pixel = 4u32;
+            let unpadded_bytes_per_row = w * bytes_per_pixel;
+            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+            let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) / align * align;
+            let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("ScreenshotStaging"),
+                size: (padded_bytes_per_row * h) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &capture_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &staging_buf,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_bytes_per_row),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            Some((staging_buf, w, h, padded_bytes_per_row, unpadded_bytes_per_row))
+        } else {
+            None
+        };
+
         // ── Pass 6: egui overlay ──────────────────────────────────────────────
         {
             let mut pass = encoder
@@ -2169,6 +2593,50 @@ impl RenderState {
         // Release egui textures that are no longer needed.
         for id in &textures_delta.free {
             self.egui_renderer.free_texture(id);
+        }
+
+        // ── Screenshot readback & save ────────────────────────────────────────
+        if let (Some((staging_buf, w, h, padded_bpr, unpadded_bpr)), Some(path)) =
+            (screenshot_staging, self.pending_screenshot.take())
+        {
+            let slice = staging_buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = tx.send(result);
+            });
+            self.device.poll(wgpu::Maintain::Wait);
+            match rx.recv() {
+                Ok(Ok(())) => {
+                    let data = slice.get_mapped_range();
+                    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+                    for row in 0..h {
+                        let offset = (row * padded_bpr) as usize;
+                        let row_data = &data[offset..offset + unpadded_bpr as usize];
+                        // BGRA → RGBA
+                        for pixel in row_data.chunks_exact(4) {
+                            rgba.push(pixel[2]); // R
+                            rgba.push(pixel[1]); // G
+                            rgba.push(pixel[0]); // B
+                            rgba.push(pixel[3]); // A
+                        }
+                    }
+                    drop(data);
+                    staging_buf.unmap();
+
+                    match image::RgbaImage::from_raw(w, h, rgba) {
+                        Some(img) => {
+                            if let Err(e) = img.save(&path) {
+                                eprintln!("png: failed to save '{}': {e}", path.display());
+                            } else {
+                                println!("Saved screenshot: {} ({}×{})", path.display(), w, h);
+                            }
+                        }
+                        None => eprintln!("png: failed to create image buffer"),
+                    }
+                }
+                Ok(Err(e)) => eprintln!("png: buffer map failed: {e}"),
+                Err(_) => eprintln!("png: buffer map channel closed"),
+            }
         }
 
         Ok(())
@@ -2254,6 +2722,122 @@ fn create_post_bg(
     })
 }
 
+/// Keep only triangles in connected mesh components (via shared welded vertices)
+/// whose triangle count is at least `min_ratio` of the largest component.
+/// Small isolated fragments — e.g. stray back-side patches left after the pocket
+/// clip — are dropped. Vertices are already welded per chain, so shared vertex
+/// indices imply connectivity.
+fn drop_small_components(n_verts: usize, idxs: Vec<u32>, min_ratio: f32) -> Vec<u32> {
+    if idxs.is_empty() {
+        return idxs;
+    }
+
+    // Union-Find over vertices.
+    let mut parent: Vec<u32> = (0..n_verts as u32).collect();
+    fn find(parent: &mut [u32], mut x: u32) -> u32 {
+        while parent[x as usize] != x {
+            parent[x as usize] = parent[parent[x as usize] as usize]; // path halving
+            x = parent[x as usize];
+        }
+        x
+    }
+    for t in idxs.chunks(3) {
+        for &b in &[t[1], t[2]] {
+            let ra = find(&mut parent, t[0]);
+            let rb = find(&mut parent, b);
+            if ra != rb {
+                parent[ra as usize] = rb;
+            }
+        }
+    }
+
+    // Flatten to a root per vertex, then count triangles per component.
+    let roots: Vec<u32> = (0..n_verts as u32).map(|v| find(&mut parent, v)).collect();
+    let mut count: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for t in idxs.chunks(3) {
+        *count.entry(roots[t[0] as usize]).or_default() += 1;
+    }
+    let max = count.values().copied().max().unwrap_or(0);
+    let threshold = ((max as f32) * min_ratio).ceil() as usize;
+
+    idxs.chunks(3)
+        .filter(|t| count[&roots[t[0] as usize]] >= threshold)
+        .flat_map(|t| t.iter().copied())
+        .collect()
+}
+
+/// Fill holes left in a triangle mesh (e.g. by the pocket clip). Boundary edges
+/// (used by a single triangle) are chained into closed loops; every loop except
+/// the largest — which is the intended open rim — is triangulated with a fan,
+/// as long as it has at most `max_hole_edges` edges. Fill triangles reuse the
+/// loop's existing vertices, so no new vertices or normals are needed.
+fn fill_mesh_holes(mut idxs: Vec<u32>, max_hole_edges: usize) -> Vec<u32> {
+    use std::collections::{HashMap, HashSet};
+    if idxs.len() < 3 {
+        return idxs;
+    }
+
+    // All directed edges present in the mesh.
+    let mut dir_edges: HashSet<(u32, u32)> = HashSet::with_capacity(idxs.len());
+    for t in idxs.chunks(3) {
+        dir_edges.insert((t[0], t[1]));
+        dir_edges.insert((t[1], t[2]));
+        dir_edges.insert((t[2], t[0]));
+    }
+
+    // Boundary directed edge (u,v): its reverse (v,u) is absent. For a manifold
+    // boundary each vertex has exactly one outgoing boundary edge → a next map.
+    let mut next: HashMap<u32, u32> = HashMap::new();
+    for &(u, v) in &dir_edges {
+        if !dir_edges.contains(&(v, u)) {
+            next.insert(u, v);
+        }
+    }
+    if next.is_empty() {
+        return idxs;
+    }
+
+    // Chain boundary edges into closed loops.
+    let mut visited: HashSet<u32> = HashSet::new();
+    let mut loops: Vec<Vec<u32>> = Vec::new();
+    let starts: Vec<u32> = next.keys().copied().collect();
+    for start in starts {
+        if visited.contains(&start) {
+            continue;
+        }
+        let mut lp = Vec::new();
+        let mut cur = start;
+        while visited.insert(cur) {
+            lp.push(cur);
+            match next.get(&cur) {
+                Some(&nv) => cur = nv,
+                None => break,
+            }
+        }
+        if lp.len() >= 3 {
+            loops.push(lp);
+        }
+    }
+
+    // The largest loop is the intended open rim; fill the rest (holes).
+    let largest = loops
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, l)| l.len())
+        .map(|(i, _)| i);
+    for (i, lp) in loops.iter().enumerate() {
+        if Some(i) == largest || lp.len() > max_hole_edges {
+            continue;
+        }
+        for k in 1..lp.len() - 1 {
+            idxs.push(lp[0]);
+            idxs.push(lp[k]);
+            idxs.push(lp[k + 1]);
+        }
+    }
+    idxs
+}
+
 // ── Pipeline builder ──────────────────────────────────────────────────────────
 
 fn build_pipeline(
@@ -2287,7 +2871,9 @@ fn build_pipeline(
         }),
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: Some(wgpu::Face::Back),
+            // No culling: both tube walls render; depth test keeps the near wall,
+            // so thin capless cylinders always read as solid rods (not half-pipes).
+            cull_mode: None,
             ..Default::default()
         },
         depth_stencil: Some(wgpu::DepthStencilState {

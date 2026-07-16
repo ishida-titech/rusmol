@@ -60,8 +60,12 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     var color = scene.rgb;
     let ao    = textureSample(ssao_tex,  lin_samp, in.uv).r;
 
-    // SSAO: darken ambient term
-    color *= mix(1.0, ao, 0.7);
+    // SSAO: darken ambient term. Ligand pixels carry an alpha mask of 0.25 and
+    // are excluded (gate = 0 below 0.5), so a translucent surface only dims the
+    // ligand through its own transparency rather than adding ambient-occlusion
+    // murk. Normal geometry has alpha 1; the empty background has alpha 0.
+    let ao_gate = step(0.5, scene.a);
+    color *= mix(1.0, ao, 0.7 * ao_gate);
 
     // Depth-based edge outline (Sobel)
     let px = 1.0 / u.screen_size;

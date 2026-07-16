@@ -2,15 +2,17 @@ use crate::structure::atom::{SecondaryStructure, Structure};
 use crate::util::color::{cpk_color, ss_color};
 
 // ── Per-atom representation bit flags ────────────────────────────────────────
-pub const REP_BALL_STICK: u8 = 0b00001;
-pub const REP_BACKBONE:   u8 = 0b00010;
-pub const REP_RIBBON:     u8 = 0b00100;
-pub const REP_SURFACE:    u8 = 0b01000;
-pub const REP_LINES:      u8 = 0b10000;
+pub const REP_BALL_STICK: u8 = 0b000001;
+pub const REP_BACKBONE:   u8 = 0b000010;
+pub const REP_RIBBON:     u8 = 0b000100;
+pub const REP_SURFACE:    u8 = 0b001000;
+pub const REP_LINES:      u8 = 0b010000;
+pub const REP_STICK:      u8 = 0b100000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepresentationType {
     BallAndStick,
+    Stick,
     Backbone,
     Ribbon,
     Surface,
@@ -21,6 +23,7 @@ impl RepresentationType {
     pub fn to_bit(self) -> u8 {
         match self {
             RepresentationType::BallAndStick => REP_BALL_STICK,
+            RepresentationType::Stick        => REP_STICK,
             RepresentationType::Backbone     => REP_BACKBONE,
             RepresentationType::Ribbon       => REP_RIBBON,
             RepresentationType::Surface      => REP_SURFACE,

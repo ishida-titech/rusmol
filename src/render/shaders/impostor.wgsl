@@ -198,7 +198,12 @@ fn fs_main(in: VertOut) -> FragOut {
     let L = normalize(u.light_dir);
     let V = normalize(u.camera_pos - hit);
 
-    let shadow = mix(1.0, shadow_factor(hit), u.shadow_strength);
+    // Ligand overlay geometry (edge_boost = 1) is excluded from shadows and (via
+    // the alpha marker below) from SSAO, so a translucent protein surface only
+    // dims the ligand through its own transparency — no extra shadow/AO murk.
+    let is_ligand = in.edge_boost >= 0.5;
+    let recv_shadow = select(u.shadow_strength, 0.0, is_ligand);
+    let shadow = mix(1.0, shadow_factor(hit), recv_shadow);
     var color = shadow * pbr_direct(N, V, L, in.color, u.roughness, u.metallic, u.light_intensity)
              + pbr_ibl(N, V, in.color, u.roughness, u.metallic);
 
@@ -208,10 +213,13 @@ fn fs_main(in: VertOut) -> FragOut {
         color += pbr_direct(N, V, L2, in.color, u.roughness, u.metallic, u.light2_intensity);
     }
 
-    // Fresnel edge darkening (stylistic silhouette)
+    // Fresnel edge darkening (stylistic silhouette). Ligand atoms (edge_boost=1)
+    // get a wider, darker rim so they stand out from the protein.
     let nv        = max(dot(N, V), 0.0);
     let eff_edge  = max(u.edge_strength, in.edge_boost);
-    let edge_dark = clamp(pow(1.0 - nv, 6.0) * 0.40 * eff_edge, 0.0, 1.0);
+    let edge_pow  = mix(6.0, 1.0, in.edge_boost);
+    let edge_amt  = mix(0.40, 1.0, in.edge_boost);
+    let edge_dark = clamp(pow(1.0 - nv, edge_pow) * edge_amt * eff_edge, 0.0, 1.0);
     color *= 1.0 - edge_dark;
 
     // Correct clip-space depth from sphere surface
@@ -219,6 +227,8 @@ fn fs_main(in: VertOut) -> FragOut {
 
     var out: FragOut;
     out.depth = clip_hit.z / clip_hit.w;
-    out.color = vec4<f32>(color, 1.0);
+    // Alpha is a post-pass mask: 1 = normal geometry, 0.25 = ligand (skip SSAO).
+    // (Not 0 — the post pass reserves alpha 0 for the empty background.)
+    out.color = vec4<f32>(color, select(1.0, 0.25, is_ligand));
     return out;
 }

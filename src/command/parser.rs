@@ -43,6 +43,13 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
             let name = rest.trim();
             Ok(Command::Get { name: if name.is_empty() { None } else { Some(name.to_string()) } })
         }
+        "png" | "screenshot" => {
+            if rest.is_empty() {
+                return Err("png: expected a file path".into());
+            }
+            Ok(Command::Png { path: PathBuf::from(rest) })
+        }
+        "docktrace" => parse_docktrace(rest),
         "help" | "h" | "?" => Ok(Command::Help),
         "quit" | "q" | "exit" => Ok(Command::Quit),
         other => Err(format!("unknown command: '{other}'")),
@@ -115,9 +122,10 @@ fn parse_color(rest: &str) -> Result<Command, String> {
 
 fn parse_repr(s: &str) -> Result<RepresentationType, String> {
     match s.to_lowercase().as_str() {
-        "ball_stick" | "ball-stick" | "bs" | "sticks" | "stick" | "ball_and_stick" | "spheres" => {
+        "ball_stick" | "ball-stick" | "bs" | "ball_and_stick" | "spheres" => {
             Ok(RepresentationType::BallAndStick)
         }
+        "stick" | "sticks" => Ok(RepresentationType::Stick),
         "backbone" | "trace" | "ca_trace" | "ca" => Ok(RepresentationType::Backbone),
         "ribbon" | "cartoon" => Ok(RepresentationType::Ribbon),
         "surface"            => Ok(RepresentationType::Surface),
@@ -181,7 +189,7 @@ fn parse_set(rest: &str) -> Result<Command, String> {
         "transparency" | "surface_transparency" | "edge_strength" | "roughness" | "metallic"
         | "ibl_intensity" | "shadow_strength" | "shadow"
         | "bloom_threshold" | "bloom_intensity" | "bloom"
-        | "surface_quality"
+        | "surface_quality" | "surface_smooth"
         | "light_intensity" | "light_elevation" | "light_azimuth"
         | "light2_intensity" | "light2_elevation" | "light2_azimuth" => {
             let value: f32 = val_str
@@ -294,6 +302,19 @@ fn split_first_word(s: &str) -> (&str, &str) {
     }
 }
 
+fn parse_docktrace(rest: &str) -> Result<Command, String> {
+    if rest.is_empty() {
+        return Err("docktrace: expected <trace_file>, <ligand_pdbqt>".into());
+    }
+    let parts = split_comma(rest, 2);
+    if parts.len() < 2 {
+        return Err("docktrace: expected <trace_file>, <ligand_pdbqt>".into());
+    }
+    let trace_path = PathBuf::from(parts[0].trim());
+    let ligand_path = PathBuf::from(parts[1].trim());
+    Ok(Command::DockTrace { trace_path, ligand_path })
+}
+
 // ── Selection helper for executor use ─────────────────────────────────────────
 
 
@@ -345,10 +366,20 @@ mod tests {
 
     #[test]
     fn show_ball_stick_aliases() {
-        for alias in &["ball_stick", "bs", "sticks", "ball_and_stick"] {
+        for alias in &["ball_stick", "bs", "ball_and_stick"] {
             assert!(matches!(
                 ok(&format!("show {alias}")),
                 Command::Show { repr: RepresentationType::BallAndStick, .. }
+            ), "alias '{alias}' failed");
+        }
+    }
+
+    #[test]
+    fn show_stick_aliases() {
+        for alias in &["stick", "sticks"] {
+            assert!(matches!(
+                ok(&format!("show {alias}")),
+                Command::Show { repr: RepresentationType::Stick, .. }
             ), "alias '{alias}' failed");
         }
     }
@@ -467,6 +498,25 @@ mod tests {
     #[test]
     fn bg_unknown_color() {
         err("bg notacolor");
+    }
+
+    // ── docktrace ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn docktrace_parse() {
+        match ok("docktrace trace.tsv, ligand.pdbqt") {
+            Command::DockTrace { trace_path, ligand_path } => {
+                assert_eq!(trace_path.to_str().unwrap(), "trace.tsv");
+                assert_eq!(ligand_path.to_str().unwrap(), "ligand.pdbqt");
+            }
+            _ => panic!("expected DockTrace"),
+        }
+    }
+
+    #[test]
+    fn docktrace_requires_two_args() {
+        err("docktrace trace.tsv");
+        err("docktrace");
     }
 
     // ── unknown command ───────────────────────────────────────────────────────

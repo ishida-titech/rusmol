@@ -1,6 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use glam::Vec3;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Bound::Excluded;
 
 use crate::scene::object::REP_RIBBON;
 use crate::structure::atom::{SecondaryStructure, Structure};
@@ -71,10 +72,13 @@ pub fn build_ribbon(
     let mut per_chain: HashMap<char, HashMap<(i32, Option<char>), (usize, Option<usize>)>> =
         HashMap::new();
 
+    // Every backbone (Cα) residue actually present in the input, per chain,
+    // regardless of the current representation flags. Used to tell a genuine
+    // data gap (missing/disordered residues) from a gap created merely by
+    // hiding the ribbon for some residues — only the former gets a dashed line.
+    let mut present: HashMap<char, BTreeSet<(i32, Option<char>)>> = HashMap::new();
+
     for (global_i, atom) in structure.atoms.iter().enumerate() {
-        if atom_rep_show.get(global_i).copied().unwrap_or(0) & REP_RIBBON == 0 {
-            continue;
-        }
         if atom.is_hetatm {
             continue;
         }
@@ -83,6 +87,15 @@ pub fn build_ribbon(
         }
         let chain = atom.residue.chain;
         let key   = (atom.residue.seq_num, atom.residue.ins_code);
+
+        if atom.name.trim() == "CA" {
+            present.entry(chain).or_default().insert(key);
+        }
+
+        // Ribbon geometry is built only from residues whose ribbon rep is on.
+        if atom_rep_show.get(global_i).copied().unwrap_or(0) & REP_RIBBON == 0 {
+            continue;
+        }
         let chain_map = per_chain.entry(chain).or_default();
         match atom.name.trim() {
             "CA" => { chain_map.entry(key).or_insert((global_i, None)).0 = global_i; }
@@ -115,17 +128,28 @@ pub fn build_ribbon(
         let mut segments: Vec<Vec<(i32, Option<char>, usize, Option<usize>)>> = Vec::new();
         let mut current = vec![sorted[0]];
 
+        let chain_present = present.get(&chain_id);
         for i in 1..sorted.len() {
             if !residues_consecutive(sorted[i - 1].0, sorted[i].0) {
-                // Record the gap for dashed-line rendering
-                let ca_prev = sorted[i - 1].2;
-                let ca_curr = sorted[i].2;
-                gaps.push(RibbonGap {
-                    p1: structure.atoms[ca_prev].position.to_array(),
-                    p2: structure.atoms[ca_curr].position.to_array(),
-                    color1: atom_colors[ca_prev],
-                    color2: atom_colors[ca_curr],
+                // The two ribbon-visible residues are non-consecutive. Emit a
+                // dashed line only if NO input residue sits between them — i.e.
+                // it is a real data gap (disorder / missing residues), not a gap
+                // produced by hiding the ribbon for residues that do exist.
+                let prev_key = (sorted[i - 1].0, sorted[i - 1].1);
+                let curr_key = (sorted[i].0, sorted[i].1);
+                let hidden_between = chain_present.is_some_and(|set| {
+                    set.range((Excluded(prev_key), Excluded(curr_key))).next().is_some()
                 });
+                if !hidden_between {
+                    let ca_prev = sorted[i - 1].2;
+                    let ca_curr = sorted[i].2;
+                    gaps.push(RibbonGap {
+                        p1: structure.atoms[ca_prev].position.to_array(),
+                        p2: structure.atoms[ca_curr].position.to_array(),
+                        color1: atom_colors[ca_prev],
+                        color2: atom_colors[ca_curr],
+                    });
+                }
                 segments.push(std::mem::take(&mut current));
             }
             current.push(sorted[i]);
@@ -275,7 +299,7 @@ fn build_segment(
     // Compute a [0,1] factor for each spline point: 0 at helix boundaries,
     // 1 at interior.  Used to taper radial scaling and frame blending.
     let helix_taper = {
-        let taper_len = N_SUB * 2; // fade over ~2 Cα intervals
+        let taper_len = N_SUB * 3; // fade over ~3 Cα intervals
         let mut taper = vec![0.0f32; m];
         let mut i = 0;
         while i < m {
@@ -584,7 +608,13 @@ fn compute_helix_radial(
         if run_len < 3 { continue; }
 
         // For each point in the run, compute local axis from a window.
+        // Skip points near boundaries where PCA is unreliable (asymmetric window).
+        let skip = N_SUB; // ~1 Cα interval (shorter than taper_len so blending starts gently)
         for j in run_start..run_end {
+            let dist_start = j - run_start;
+            let dist_end = run_end - 1 - j;
+            if dist_start < skip || dist_end < skip { continue; }
+
             let half = HELIX_AXIS_WINDOW;
             let lo = if j >= run_start + half { j - half } else { run_start };
             let hi = (j + half + 1).min(run_end);

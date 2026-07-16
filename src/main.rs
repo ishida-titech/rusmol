@@ -1,6 +1,7 @@
 mod app;
 mod cli;
 mod command;
+mod docktrace;
 mod render;
 mod scene;
 mod structure;
@@ -20,31 +21,66 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     if cli.files.is_empty() {
-        eprintln!("Error: no input file specified.\nUsage: rusmol <file.pdb> [file2.pdb ...]");
+        eprintln!(
+            "RusMol {}\n\
+             Error: no input file specified.\n\n\
+             Usage: rusmol <file.pdb|file.pdbqt> [more files ...] [-c \"commands\"]\n\
+             Try:   rusmol --help",
+            env!("CARGO_PKG_VERSION"),
+        );
         std::process::exit(1);
     }
+
+    // ── Startup banner ────────────────────────────────────────────────────
+    // The title (name + version, then a one-line description) is boxed between
+    // two horizontal rules; each loaded structure follows as a small tree whose
+    // rows share a "|" gutter. ASCII only, so it renders on any terminal.
+    let rule = "-".repeat(70);
+    eprintln!();
+    eprintln!("{rule}");
+    eprintln!("  RusMol   version {}", env!("CARGO_PKG_VERSION"));
+    eprintln!("    a Rust-based lightweight Molecular structure viewer");
+    eprintln!("{rule}");
+    eprintln!();
 
     // Load all files into scene
     let mut scene = Scene::new();
     for path in &cli.files {
-        match structure::pdb::parse_pdb(path) {
+        let is_pdbqt = path.extension().map_or(false, |e| e.eq_ignore_ascii_case("pdbqt"));
+        let parse_result = if is_pdbqt {
+            structure::pdb::parse_pdbqt(path)
+        } else {
+            structure::pdb::parse_pdb(path)
+        };
+        match parse_result {
             Ok(structure) => {
                 let name = path
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("mol")
                     .to_string();
+                let n_atoms = structure.atoms.len();
                 let summary = command::executor::structure_summary(&structure);
                 scene.add_object(MolecularObject::new(name.clone(), structure));
-                eprintln!("Loaded '{name}' from {}", path.display());
-                eprintln!("{summary}");
+
+                eprintln!("  {name}  -  {n_atoms} atoms  ({})", path.display());
+                for line in summary.lines() {
+                    if line.is_empty() {
+                        eprintln!();
+                    } else {
+                        eprintln!("  {line}");
+                    }
+                }
+                eprintln!();
             }
             Err(e) => {
-                eprintln!("Error loading {}: {e}", path.display());
+                eprintln!("  Error loading {}: {e}", path.display());
                 std::process::exit(1);
             }
         }
     }
+
+    eprintln!("Type 'help' for the command reference.");
 
     // Split -c commands into lines
     let initial_commands: Vec<String> = cli

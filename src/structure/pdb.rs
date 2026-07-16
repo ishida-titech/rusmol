@@ -8,8 +8,18 @@ use super::secondary::{assign_ss, SsRange};
 
 /// Parse a PDB file and return a Structure with bonds estimated.
 pub fn parse_pdb(path: &Path) -> Result<Structure> {
+    parse_pdb_inner(path, false)
+}
+
+/// Parse a PDBQT file (AutoDock format) and return a Structure with bonds estimated.
+pub fn parse_pdbqt(path: &Path) -> Result<Structure> {
+    parse_pdb_inner(path, true)
+}
+
+fn parse_pdb_inner(path: &Path, is_pdbqt: bool) -> Result<Structure> {
+    let label = if is_pdbqt { "PDBQT" } else { "PDB" };
     let content = std::fs::read_to_string(path)
-        .with_context(|| format!("Failed to read PDB file: {}", path.display()))?;
+        .with_context(|| format!("Failed to read {} file: {}", label, path.display()))?;
 
     let mut structure = Structure::new();
     let mut conect: Vec<(u32, u32)> = Vec::new();
@@ -25,7 +35,7 @@ pub fn parse_pdb(path: &Path) -> Result<Structure> {
         let record = if line.len() >= 6 { &line[..6] } else { line };
         match record.trim() {
             "ATOM" | "HETATM" => {
-                match parse_atom_line(line, record.trim() == "HETATM") {
+                match parse_atom_line(line, record.trim() == "HETATM", is_pdbqt) {
                     Ok(atom) => structure.atoms.push(atom),
                     Err(e) => log::warn!("line {}: {}", line_no + 1, e),
                 }
@@ -45,6 +55,8 @@ pub fn parse_pdb(path: &Path) -> Result<Structure> {
             "HETNAM" => accumulate_het_record(line, &mut hetnam_map),
             "HETSYN" => accumulate_het_record(line, &mut hetsyn_map),
             "END" | "ENDMDL" => break,
+            // PDBQT-specific records — skip silently
+            "ROOT" | "ENDROOT" | "BRANCH" | "ENDBRA" | "TORSDO" => {}
             _ => {}
         }
     }
@@ -55,12 +67,6 @@ pub fn parse_pdb(path: &Path) -> Result<Structure> {
     structure.hetsyn = hetsyn_map;
 
     structure.build_index();
-
-    // Translate all atoms so centroid is at origin
-    let centroid = structure.centroid();
-    for atom in &mut structure.atoms {
-        atom.position -= centroid;
-    }
 
     structure.ss = assign_ss(&structure.atoms, &ss_ranges);
 
@@ -73,7 +79,8 @@ pub fn parse_pdb(path: &Path) -> Result<Structure> {
     }
 
     log::info!(
-        "parse_pdb '{}': {} atoms, {} bonds, {} chains",
+        "parse_{} '{}': {} atoms, {} bonds, {} chains",
+        label.to_lowercase(),
         path.display(),
         structure.atoms.len(),
         structure.bonds.len(),
@@ -259,21 +266,10 @@ fn parse_conect_line(line: &str, conect: &mut Vec<(u32, u32)>) {
     }
 }
 
-fn parse_atom_line(line: &str, is_hetatm: bool) -> Result<Atom> {
-    // PDB column layout (1-indexed, converted to 0-indexed slices):
-    //  7-11:  serial       (cols 6..11)
-    // 13-16:  name         (cols 12..16)
-    // 17:     alt_loc      (col  16)
-    // 18-20:  resname      (cols 17..20)
-    // 22:     chain        (col  21)
-    // 23-26:  resseq       (cols 22..26)
-    // 27:     icode        (col  26)
-    // 31-38:  x            (cols 30..38)
-    // 39-46:  y            (cols 38..46)
-    // 47-54:  z            (cols 46..54)
-    // 55-60:  occupancy    (cols 54..60)
-    // 61-66:  tempFactor   (cols 60..66)
-    // 77-78:  element      (cols 76..78)
+fn parse_atom_line(line: &str, is_hetatm: bool, is_pdbqt: bool) -> Result<Atom> {
+    // Columns 1-66 are identical between PDB and PDBQT.
+    // PDB  cols 77-78: element symbol
+    // PDBQT cols 69-76: partial charge, cols 77-79: AutoDock atom type
 
     let col = |start: usize, end: usize| -> &str {
         let end = end.min(line.len());
@@ -309,7 +305,9 @@ fn parse_atom_line(line: &str, is_hetatm: bool) -> Result<Atom> {
 
     let temp_factor: f32 = col(60, 66).trim().parse().unwrap_or(0.0);
 
-    let element = {
+    let element = if is_pdbqt {
+        pdbqt_atom_type_to_element(col(77, 80).trim())
+    } else {
         let e = col(76, 78).trim().to_uppercase();
         if !e.is_empty() {
             e
@@ -344,6 +342,41 @@ fn parse_atom_line(line: &str, is_hetatm: bool) -> Result<Atom> {
         element,
         is_hetatm,
     })
+}
+
+pub fn pdbqt_atom_type_to_element(atype: &str) -> String {
+    match atype {
+        "A"  => "C",  // aromatic carbon
+        "C"  => "C",
+        "N"  => "N",
+        "NA" => "N",  // nitrogen acceptor
+        "NS" => "N",
+        "OA" => "O",  // oxygen acceptor
+        "OS" => "O",
+        "S"  => "S",
+        "SA" => "S",  // sulfur acceptor
+        "H"  => "H",
+        "HD" => "H",  // hydrogen donor
+        "HS" => "H",
+        "P"  => "P",
+        "F"  => "F",
+        "I"  => "I",
+        "Cl" | "CL" => "CL",
+        "Br" | "BR" => "BR",
+        "Fe" | "FE" => "FE",
+        "Zn" | "ZN" => "ZN",
+        "Mg" | "MG" => "MG",
+        "Mn" | "MN" => "MN",
+        "Ca" | "CA" => "CA",
+        "Cu" | "CU" => "CU",
+        "Na" => "NA",
+        "K"  => "K",
+        "W"  => "O",  // water oxygen
+        other => {
+            let s = other.trim();
+            if s.is_empty() { "C" } else { s }
+        }
+    }.to_string()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -411,10 +444,12 @@ mod tests {
     }
 
     #[test]
-    fn crn_centroid_near_origin() {
-        // parse_pdb translates the structure so centroid ≈ origin
+    fn crn_centroid_preserves_original() {
+        // parse_pdb preserves original PDB coordinates (no centering)
         let s = parse_pdb(&fixture("1crn.pdb")).unwrap();
-        assert!(s.centroid().length() < 0.5, "centroid should be near origin");
+        let c = s.centroid();
+        // 1CRN centroid is around (14.8, 10.0, 8.9) — not near origin
+        assert!(c.length() > 5.0, "centroid should preserve PDB coordinates");
     }
 
     #[test]
@@ -467,5 +502,104 @@ mod tests {
         for (_, name) in &s.compnd {
             assert!(!name.is_empty(), "molecule name should not be empty");
         }
+    }
+
+    // ── PDBQT ───────────────────────────────────────────────────────────────
+
+    fn dock_fixture(name: &str) -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/dock_trace")
+            .join(name)
+    }
+
+    #[test]
+    fn pdbqt_atom_count() {
+        let s = parse_pdbqt(&dock_fixture("receptor.pdbqt")).unwrap();
+        assert_eq!(s.atoms.len(), 2777);
+    }
+
+    #[test]
+    fn pdbqt_has_bonds() {
+        let s = parse_pdbqt(&dock_fixture("receptor.pdbqt")).unwrap();
+        assert!(!s.bonds.is_empty());
+    }
+
+    #[test]
+    fn pdbqt_ca_carbon_element() {
+        let s = parse_pdbqt(&dock_fixture("receptor.pdbqt")).unwrap();
+        let ca = s.atoms.iter().find(|a| a.name.trim() == "CA" && !a.is_hetatm).unwrap();
+        assert_eq!(ca.element, "C");
+    }
+
+    #[test]
+    fn pdbqt_calcium_hetatm() {
+        let s = parse_pdbqt(&dock_fixture("receptor.pdbqt")).unwrap();
+        let ca_het = s.atoms.iter().find(|a| a.is_hetatm && a.residue.name == "CA").unwrap();
+        assert_eq!(ca_het.element, "CA");
+    }
+
+    #[test]
+    fn pdbqt_nitrogen_element() {
+        let s = parse_pdbqt(&dock_fixture("receptor.pdbqt")).unwrap();
+        let n = s.atoms.iter().find(|a| a.name.trim() == "N" && !a.is_hetatm).unwrap();
+        assert_eq!(n.element, "N");
+    }
+
+    #[test]
+    fn pdbqt_oxygen_acceptor_element() {
+        let s = parse_pdbqt(&dock_fixture("receptor.pdbqt")).unwrap();
+        let o = s.atoms.iter().find(|a| a.name.trim() == "O" && !a.is_hetatm).unwrap();
+        assert_eq!(o.element, "O");
+    }
+
+    #[test]
+    fn pdbqt_hydrogen_donor_element() {
+        let s = parse_pdbqt(&dock_fixture("receptor.pdbqt")).unwrap();
+        let h = s.atoms.iter().find(|a| a.name.trim().starts_with("H") && !a.is_hetatm).unwrap();
+        assert_eq!(h.element, "H");
+    }
+
+    #[test]
+    fn pdbqt_hydrogens_are_bonded() {
+        // Hydrogens are absent from the built-in bond tables; the distance-based
+        // fallback must connect every H to a heavy atom so none floats.
+        let s = parse_pdbqt(&dock_fixture("receptor.pdbqt")).unwrap();
+        let bonded: std::collections::HashSet<usize> = s
+            .bonds
+            .iter()
+            .flat_map(|b| [b.atom1, b.atom2])
+            .collect();
+        let floating: Vec<usize> = s
+            .atoms
+            .iter()
+            .enumerate()
+            .filter(|(i, a)| a.element == "H" && !bonded.contains(i))
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            floating.is_empty(),
+            "{} hydrogen(s) left without a bond",
+            floating.len()
+        );
+    }
+
+    #[test]
+    fn pdbqt_has_two_chains() {
+        let s = parse_pdbqt(&dock_fixture("receptor.pdbqt")).unwrap();
+        assert!(s.chain_ranges.contains_key(&'A'));
+        assert!(s.chain_ranges.contains_key(&'B'));
+    }
+
+    #[test]
+    fn pdbqt_atom_type_mapping() {
+        assert_eq!(pdbqt_atom_type_to_element("C"), "C");
+        assert_eq!(pdbqt_atom_type_to_element("A"), "C");
+        assert_eq!(pdbqt_atom_type_to_element("N"), "N");
+        assert_eq!(pdbqt_atom_type_to_element("NA"), "N");
+        assert_eq!(pdbqt_atom_type_to_element("OA"), "O");
+        assert_eq!(pdbqt_atom_type_to_element("HD"), "H");
+        assert_eq!(pdbqt_atom_type_to_element("SA"), "S");
+        assert_eq!(pdbqt_atom_type_to_element("Ca"), "CA");
+        assert_eq!(pdbqt_atom_type_to_element("Br"), "BR");
     }
 }
