@@ -14,6 +14,13 @@ const CUTOFF: f32 = 5.0;
 /// Probe radius for SES (water molecule radius).
 const PROBE_RADIUS: f32 = 1.4;
 
+/// Morphological-closing radius (Å) applied to the density field before
+/// Marching Cubes. Closing (dilate then erode) seals interior tunnels and
+/// surface pits narrower than 2× this radius — including the spurious
+/// through-holes Marching Cubes can leave in thin protein regions — while
+/// leaving genuine clefts and pockets wider than the ball untouched.
+const SURFACE_CLOSE_RADIUS: f32 = 1.5;
+
 /// Taubin mesh-smoothing parameters (removes marching-cubes grid quantization
 /// bumps without the volumetric shrinkage of plain Laplacian smoothing).
 /// The iteration count is passed in at runtime (`set surface_smooth`).
@@ -599,6 +606,215 @@ fn fill_density_ses(
         });
 }
 
+/// Separable 3×3×3 box blur, applied `passes` times in place. Border cells
+/// clamp (the missing neighbour repeats the cell's own value). Used to mollify
+/// the closing set's binary indicator so its 0.5-isosurface is smooth rather
+/// than following the grid staircase.
+fn box_blur3(grid: &mut [f32], nx: usize, ny: usize, nz: usize, passes: usize) {
+    let slab = ny * nz;
+    let third = 1.0 / 3.0;
+    for _ in 0..passes {
+        // z axis: each (i,j) row is contiguous.
+        grid.par_chunks_mut(nz).for_each(|row| {
+            let n = row.len();
+            if n == 0 { return; }
+            let mut prev = row[0]; // original value of the previous cell
+            for i in 0..n {
+                let cur = row[i];
+                let nxt = if i + 1 < n { row[i + 1] } else { cur };
+                row[i] = (prev + cur + nxt) * third;
+                prev = cur;
+            }
+        });
+        // y axis: gather each (i,k) column into a scratch buffer.
+        grid.par_chunks_mut(slab).for_each(|plane| {
+            let mut col = vec![0.0f32; ny];
+            for k in 0..nz {
+                for j in 0..ny {
+                    col[j] = plane[j * nz + k];
+                }
+                let mut prev = col[0];
+                for j in 0..ny {
+                    let cur = col[j];
+                    let nxt = if j + 1 < ny { col[j + 1] } else { cur };
+                    plane[j * nz + k] = (prev + cur + nxt) * third;
+                    prev = cur;
+                }
+            }
+        });
+        // x axis: transpose to x-major, blur contiguous rows, transpose back.
+        let mut t = vec![0.0f32; nx * ny * nz];
+        for i in 0..nx {
+            for jk in 0..slab {
+                t[jk * nx + i] = grid[i * slab + jk];
+            }
+        }
+        t.par_chunks_mut(nx).for_each(|row| {
+            let n = row.len();
+            if n == 0 { return; }
+            let mut prev = row[0];
+            for i in 0..n {
+                let cur = row[i];
+                let nxt = if i + 1 < n { row[i + 1] } else { cur };
+                row[i] = (prev + cur + nxt) * third;
+                prev = cur;
+            }
+        });
+        for i in 0..nx {
+            for jk in 0..slab {
+                grid[i * slab + jk] = t[jk * nx + i];
+            }
+        }
+    }
+}
+
+/// Morphological closing of the inside set (density >= THRESHOLD) on the
+/// density grid: dilate by `radius` Å, then erode by the same radius. This
+/// seals interior tunnels and pits narrower than 2×`radius` while preserving
+/// the outer surface, because closing is extensive (E ⊇ A) and only ever
+/// *raises* a cell's density here — never lowers it.
+///
+/// Both passes reuse `edt_3d`: the dilation is "within `radius` of an inside
+/// cell", the erosion is "at least `radius` from a non-dilated cell". The
+/// erosion's boundary is a thresholded set, so its raw indicator staircases
+/// along the grid; we box-blur that indicator and take its 0.5-isosurface as
+/// the sealed density, which gives Marching Cubes a smooth patch instead of
+/// the blocky ridges a raw distance step would leave.
+///
+/// Returns the number of cells newly pushed to/above THRESHOLD (for logging).
+fn close_density(
+    density: &mut [f32],
+    nx: usize,
+    ny: usize,
+    nz: usize,
+    step: f32,
+    radius: f32,
+) -> usize {
+    if radius <= 0.0 {
+        return 0;
+    }
+    let r_cells = radius / step; // ball radius in grid cells
+    let r_cells_sq = r_cells * r_cells;
+    let big = (nx * nx + ny * ny + nz * nz) as f32 + 1.0;
+
+    // ── Dilation: squared distance from each cell to the nearest inside cell.
+    // Seeds (distance 0) = inside cells; everything else starts at `big`.
+    let mut dist_a: Vec<f32> = density
+        .par_iter()
+        .map(|&d| if d >= THRESHOLD { 0.0 } else { big })
+        .collect();
+    edt_3d(&mut dist_a, nx, ny, nz);
+    // Dilated set D = { x : dist_a[x] <= r_cells_sq }.
+
+    // ── Erosion of D: squared distance from each cell to the nearest cell
+    // OUTSIDE D. Seeds (distance 0) = complement(D); D cells start at `big`.
+    let mut dist_d: Vec<f32> = dist_a
+        .par_iter()
+        .map(|&da| if da > r_cells_sq { 0.0 } else { big })
+        .collect();
+    drop(dist_a);
+    edt_3d(&mut dist_d, nx, ny, nz);
+    // Closed set E = erosion of D = { x : dist_d[x] > r_cells_sq }.
+
+    // ── Mollify the binary indicator of E so its isosurface is smooth. ──
+    let mut soft: Vec<f32> = dist_d
+        .par_iter()
+        .map(|&dd| if dd > r_cells_sq { 1.0 } else { 0.0 })
+        .collect();
+    drop(dist_d);
+    box_blur3(&mut soft, nx, ny, nz, 2);
+
+    // ── Combine: the field equals THRESHOLD where the smoothed indicator is
+    // 0.5 (∂E), higher inside, lower outside. `max` keeps the finer original
+    // density everywhere except in the newly-sealed tunnel/pit cells.
+    density
+        .par_iter_mut()
+        .zip(soft.par_iter())
+        .map(|(den, &s)| {
+            let field = s * (2.0 * THRESHOLD); // == THRESHOLD at s = 0.5
+            if field > *den {
+                let was_outside = *den < THRESHOLD;
+                *den = field;
+                (was_outside && field >= THRESHOLD) as usize
+            } else {
+                0
+            }
+        })
+        .sum::<usize>()
+}
+
+/// Fill in colours for cells the closing step sealed (they carry no atom
+/// colour of their own) by propagating from their coloured neighbours. Sealed
+/// tunnel cells are only a few cells thick, so a bounded flood from the known
+/// frontier reaches them all in a handful of passes.
+fn inpaint_colors(
+    cell_color: &mut [[f32; 3]],
+    colored: &[bool],
+    density: &[f32],
+    nx: usize,
+    ny: usize,
+    nz: usize,
+) {
+    let n = nx * ny * nz;
+    let slab = ny * nz;
+    let neigh = |i: usize| -> [Option<usize>; 6] {
+        let k = i % nz;
+        let j = (i / nz) % ny;
+        let ii = i / slab;
+        [
+            if ii > 0 { Some(i - slab) } else { None },
+            if ii + 1 < nx { Some(i + slab) } else { None },
+            if j > 0 { Some(i - nz) } else { None },
+            if j + 1 < ny { Some(i + nz) } else { None },
+            if k > 0 { Some(i - 1) } else { None },
+            if k + 1 < nz { Some(i + 1) } else { None },
+        ]
+    };
+
+    // Cells that need a colour: inside after closing but never coloured by an atom.
+    let targets: Vec<usize> = (0..n)
+        .into_par_iter()
+        .filter(|&i| density[i] >= THRESHOLD && !colored[i])
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+
+    let mut known = colored.to_vec();
+    for _ in 0..64 {
+        // Snapshot-based pass: each target reads the previous frontier only.
+        let updates: Vec<(usize, [f32; 3])> = targets
+            .par_iter()
+            .filter(|&&i| !known[i])
+            .filter_map(|&i| {
+                let mut sum = [0.0f32; 3];
+                let mut cnt = 0u32;
+                for nb in neigh(i).into_iter().flatten() {
+                    if known[nb] {
+                        sum[0] += cell_color[nb][0];
+                        sum[1] += cell_color[nb][1];
+                        sum[2] += cell_color[nb][2];
+                        cnt += 1;
+                    }
+                }
+                if cnt > 0 {
+                    let inv = 1.0 / cnt as f32;
+                    Some((i, [sum[0] * inv, sum[1] * inv, sum[2] * inv]))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if updates.is_empty() {
+            break;
+        }
+        for (i, c) in updates {
+            cell_color[i] = c;
+            known[i] = true;
+        }
+    }
+}
+
 /// Build an isosurface mesh from the molecular density field.
 /// Appends to the provided vertex and index buffers (same layout as ribbon).
 /// Water molecules (HOH/WAT/DOD) are excluded from the density computation.
@@ -703,8 +919,15 @@ fn build_surface_for_atoms(
         }
     }
 
+    // Cells that received an atom colour, captured before closing seals any
+    // tunnels; the sealed cells carry no colour and are inpainted afterwards.
+    let colored: Vec<bool> = density.par_iter().map(|&d| d > 1e-6).collect();
+
+    // Morphological closing: seal spurious interior tunnels / narrow pits.
+    let n_sealed = close_density(&mut density, nx, ny, nz, step, SURFACE_CLOSE_RADIUS);
+
     // Normalize per-cell colors
-    let cell_color: Vec<[f32; 3]> = density
+    let mut cell_color: Vec<[f32; 3]> = density
         .par_iter()
         .zip(color_sum.par_iter())
         .map(|(&d, c)| {
@@ -717,6 +940,14 @@ fn build_surface_for_atoms(
         })
         .collect();
     drop(color_sum); // free memory before MC
+
+    // Give the sealed tunnel cells a colour borrowed from their neighbours so
+    // they blend into the surface instead of rendering as black/grey patches.
+    if n_sealed > 0 {
+        inpaint_colors(&mut cell_color, &colored, &density, nx, ny, nz);
+        log::debug!("close_density: sealed {n_sealed} tunnel/pit cells");
+    }
+    drop(colored);
 
     // ── 5. Marching Cubes (parallelised over the ci dimension) ────────────────
     // density and cell_color are read-only from here on; share via references.
