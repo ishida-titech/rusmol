@@ -20,6 +20,11 @@ const PROBE_RADIUS: f32 = 1.4;
 const SMOOTH_LAMBDA: f32 = 0.5;
 const SMOOTH_MU: f32 = -0.53;
 
+/// Largest boundary loop (in edges) that `fill_all_holes` will patch. Marching
+/// Cubes leaves only a handful of tiny gaps, so this stays small; a larger loop
+/// is left alone rather than fan-filled into a flat sheet.
+const HOLE_MAX_EDGES: usize = 64;
+
 /// Surface computation method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurfaceType {
@@ -983,6 +988,13 @@ fn build_surface_for_atoms(
                 .map(|&i| welded_remap[i as usize])
                 .collect();
 
+            // ── Step 4.5: Close Marching-Cubes gaps ──────────────────────────
+            // The MC output occasionally leaves a few tiny holes (missing
+            // triangles). On a closed molecular surface every such hole is a
+            // defect, so fill them all before smoothing — otherwise the gaps
+            // show through as speckles, especially over a light background.
+            let local_idxs = fill_all_holes(local_idxs, HOLE_MAX_EDGES);
+
             // ── Step 5: Taubin smoothing (removes grid-quantization bumps) ────
             if smooth_iters > 0 {
                 smooth_surface_mesh(&mut final_verts, &local_idxs, smooth_iters);
@@ -1051,6 +1063,97 @@ fn build_surface_for_atoms(
 /// `indices` are triangle indices in the local `verts` index space. The
 /// recomputed geometric normal is re-oriented to agree with the original
 /// gradient-based normal, so it stays correct regardless of triangle winding.
+/// Fill every boundary-loop hole in a mesh by fan-triangulation.
+///
+/// A watertight surface has no boundary edges: every undirected edge is shared
+/// by two oppositely-wound triangles. Marching Cubes occasionally drops a
+/// triangle, leaving a small open loop that renders as a see-through hole. This
+/// chains the boundary edges into closed loops and fans each one shut. Unlike
+/// the pocket-mode filler it fills *all* loops (a closed surface has no intended
+/// rim); loops longer than `max_edges` are left alone to avoid flat sheets.
+fn fill_all_holes(mut idxs: Vec<u32>, max_edges: usize) -> Vec<u32> {
+    use std::collections::{HashMap, HashSet};
+    if idxs.len() < 3 {
+        return idxs;
+    }
+
+    // All directed edges present in the mesh.
+    let mut dir_edges: HashSet<(u32, u32)> = HashSet::with_capacity(idxs.len());
+    for t in idxs.chunks(3) {
+        dir_edges.insert((t[0], t[1]));
+        dir_edges.insert((t[1], t[2]));
+        dir_edges.insert((t[2], t[0]));
+    }
+
+    // A directed edge (u,v) is a boundary edge when its reverse is absent. A
+    // vertex may have several outgoing boundary edges (non-manifold junctions),
+    // so store them all and consume each exactly once when walking loops.
+    let mut adj: HashMap<u32, Vec<u32>> = HashMap::new();
+    let mut boundary_starts: Vec<u32> = Vec::new();
+    for &(u, v) in &dir_edges {
+        if !dir_edges.contains(&(v, u)) {
+            adj.entry(u).or_default().push(v);
+            boundary_starts.push(u);
+        }
+    }
+    if adj.is_empty() {
+        return idxs;
+    }
+    let n_boundary: usize = adj.values().map(|a| a.len()).sum();
+
+    // Per-vertex pointer into its unused outgoing boundary edges.
+    let mut ptr: HashMap<u32, usize> = HashMap::new();
+    let mut n_filled = 0usize;
+    let mut n_skipped = 0usize;
+    for start in boundary_starts {
+        // Walk closed loops out of `start` until all its edges are consumed.
+        loop {
+            let p0 = *ptr.get(&start).unwrap_or(&0);
+            if p0 >= adj.get(&start).map_or(0, |a| a.len()) {
+                break;
+            }
+            let mut lp = Vec::new();
+            let mut cur = start;
+            let mut closed = false;
+            loop {
+                let p = ptr.entry(cur).or_insert(0);
+                let outs = match adj.get(&cur) {
+                    Some(o) if *p < o.len() => o,
+                    _ => break, // dead end: an open path, not a closable loop
+                };
+                let nxt = outs[*p];
+                *p += 1;
+                lp.push(cur);
+                cur = nxt;
+                if cur == start {
+                    closed = true;
+                    break; // loop closed
+                }
+            }
+            // Only fan a walk that returned to its start (a genuine closed loop);
+            // an open path has no implicit closing edge to triangulate against.
+            // Boundary edges run lp[0]→lp[1]→…; a sealing triangle must carry the
+            // REVERSE edge, so wind it (lp[0], lp[k+1], lp[k]).
+            if closed && lp.len() >= 3 && lp.len() <= max_edges {
+                for k in 1..lp.len() - 1 {
+                    idxs.push(lp[0]);
+                    idxs.push(lp[k + 1]);
+                    idxs.push(lp[k]);
+                }
+                n_filled += 1;
+            } else if lp.len() >= 3 {
+                n_skipped += 1;
+            }
+        }
+    }
+
+    log::debug!(
+        "fill_all_holes: {} boundary edges, filled {} loops, skipped {} (too large)",
+        n_boundary, n_filled, n_skipped,
+    );
+    idxs
+}
+
 fn smooth_surface_mesh(verts: &mut [RibbonVertex], indices: &[u32], iterations: usize) {
     let n = verts.len();
     if n == 0 || indices.len() < 3 {
@@ -1121,13 +1224,12 @@ fn smooth_surface_mesh(verts: &mut [RibbonVertex], indices: &[u32], iterations: 
         verts[i].position = pos[i].to_array();
         let len = normals[i].length();
         if len > 1e-8 {
-            let orig = Vec3::from(verts[i].normal);
-            let mut nrm = normals[i] / len;
-            // Keep the gradient-derived orientation (winding may be inconsistent).
-            if nrm.dot(orig) < 0.0 {
-                nrm = -nrm;
-            }
-            verts[i].normal = nrm.to_array();
+            // The accumulated normal is already oriented outward (each face was
+            // aligned to its vertices' gradient normals above). Do NOT re-flip
+            // against a single vertex's gradient normal here: that reference is
+            // occasionally noisy/inward and would flip an otherwise-correct
+            // normal inward, producing a dark back-face speckle.
+            verts[i].normal = (normals[i] / len).to_array();
         }
     }
 }
