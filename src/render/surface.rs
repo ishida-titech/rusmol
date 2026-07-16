@@ -1096,10 +1096,22 @@ fn smooth_surface_mesh(verts: &mut [RibbonVertex], indices: &[u32], iterations: 
     }
 
     // ── Recompute normals (area-weighted face normals) ──────────────────────
+    // Marching Cubes triangle winding is not globally consistent, so a raw
+    // area-weighted sum lets oppositely-wound neighbouring faces cancel and
+    // leaves some vertices with a garbage-direction normal — which the surface
+    // shader then renders as a dark back-face speckle ("holes"). Orient each
+    // face normal to agree with its vertices' original gradient normals before
+    // accumulating, so the sum is winding-independent.
     let mut normals = vec![Vec3::ZERO; n];
     for tri in indices.chunks(3) {
         let (a, b, c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
-        let fnrm = (pos[b] - pos[a]).cross(pos[c] - pos[a]);
+        let mut fnrm = (pos[b] - pos[a]).cross(pos[c] - pos[a]);
+        let ref_n = Vec3::from(verts[a].normal)
+            + Vec3::from(verts[b].normal)
+            + Vec3::from(verts[c].normal);
+        if fnrm.dot(ref_n) < 0.0 {
+            fnrm = -fnrm;
+        }
         normals[a] += fnrm;
         normals[b] += fnrm;
         normals[c] += fnrm;
