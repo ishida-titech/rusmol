@@ -76,21 +76,23 @@ cargo install --path .
 
 ## Quick Start
 
-The repository ships with sample structures under `tests/`. Try them right away:
+The repository ships with sample structures under `tests/`. After building,
+run the `rusmol` binary from the repository root (add it to your `PATH` with
+`cargo install --path .`, or use `./target/release/rusmol`):
 
 ```sh
 # A small protein (crambin)
-cargo run --release -- tests/fixtures/1crn.pdb
+rusmol tests/fixtures/1crn.pdb
 
 # A larger two-chain structure, colored by chain
-cargo run --release -- tests/fixtures/2je5.pdb -c "color chain"
+rusmol tests/fixtures/2je5.pdb -c "color chain"
 
 # A docking receptor + ligand, shown as a per-chain surface
-cargo run --release -- tests/dock_trace/receptor.pdbqt tests/dock_trace/ligand.pdbqt \
+rusmol tests/dock_trace/receptor.pdbqt tests/dock_trace/ligand.pdbqt \
   -c "show surface; color chain"
 
 # Fully scripted, headless-style: render to PNG and quit
-cargo run --release -- tests/fixtures/2je5.pdb \
+rusmol tests/fixtures/2je5.pdb \
   -c "show surface; color chain; bg white; png out.png; quit"
 ```
 
