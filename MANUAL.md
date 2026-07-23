@@ -1,6 +1,6 @@
 # rusmol v0.3 User Manual
 
-rusmol is a lightweight molecular structure viewer for proteins and nucleic acids, written in Rust with wgpu (Metal backend). It features a PyMOL-compatible command set, interactive 3D rendering, and sub-second cold start.
+rusmol is a lightweight molecular structure viewer for proteins and nucleic acids, written in Rust with wgpu (Metal on macOS, Vulkan on Linux). It features a PyMOL-compatible command set, interactive 3D rendering, and sub-second cold start.
 
 ## Table of Contents
 

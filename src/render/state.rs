@@ -268,7 +268,9 @@ impl RenderState {
     pub async fn new(window: Arc<Window>) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::METAL,
+            // PRIMARY covers Metal (macOS), Vulkan (Linux), and DX12 (Windows);
+            // the platform's native backend is chosen automatically.
+            backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
         let surface = instance.create_surface(window)?;
@@ -2608,16 +2610,27 @@ impl RenderState {
             match rx.recv() {
                 Ok(Ok(())) => {
                     let data = slice.get_mapped_range();
+                    // The capture texture uses the swapchain format, which is
+                    // BGRA-ordered on Metal but RGBA-ordered on many Vulkan
+                    // (Linux) adapters. Swap red/blue only for BGRA formats so
+                    // the saved PNG is correct on every backend.
+                    let swap_rb = matches!(
+                        self.config.format,
+                        wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm
+                    );
                     let mut rgba = Vec::with_capacity((w * h * 4) as usize);
                     for row in 0..h {
                         let offset = (row * padded_bpr) as usize;
                         let row_data = &data[offset..offset + unpadded_bpr as usize];
-                        // BGRA → RGBA
                         for pixel in row_data.chunks_exact(4) {
-                            rgba.push(pixel[2]); // R
-                            rgba.push(pixel[1]); // G
-                            rgba.push(pixel[0]); // B
-                            rgba.push(pixel[3]); // A
+                            if swap_rb {
+                                rgba.push(pixel[2]); // R
+                                rgba.push(pixel[1]); // G
+                                rgba.push(pixel[0]); // B
+                                rgba.push(pixel[3]); // A
+                            } else {
+                                rgba.extend_from_slice(pixel); // already RGBA
+                            }
                         }
                     }
                     drop(data);

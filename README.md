@@ -5,7 +5,7 @@ nucleic acids — a PyMOL-compatible command set, interactive 3D rendering, and
 sub-second cold start, built on [wgpu](https://wgpu.rs/).
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
+![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)
 
 <p align="center">
   <img src="assets/hero_ribbon.png" alt="RusMol rendering a two-chain protein as ribbons colored by chain" width="480">
@@ -41,10 +41,13 @@ sub-second cold start, built on [wgpu](https://wgpu.rs/).
 
 ## Platform
 
-RusMol currently renders through the **Metal** backend and therefore runs on
-**macOS only** (Apple Silicon and Intel). Linux/Windows are not yet supported;
-the backend selection is a single line in `src/render/state.rs`, so a
-cross-platform build is feasible but has not been tested.
+RusMol runs on **macOS** (Metal) and **Linux** (Vulkan); wgpu selects the
+platform's native backend automatically. Windows (DX12) is likely to work but
+has not been tested.
+
+> **Note:** Linux support is newly enabled and not yet verified on real
+> hardware. On some Linux GPUs, 4× MSAA on a 16-bit-float render target may not
+> be supported; if the window fails to initialize, please open an issue.
 
 ## Installation
 
@@ -58,7 +61,25 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 RusMol requires Rust **1.80 or newer** (edition 2021).
 
-### 2. Build
+### 2. Install system libraries (Linux only)
+
+On Linux, the windowing/clipboard/GPU stack needs a few development and runtime
+packages. On Debian/Ubuntu:
+
+```sh
+sudo apt install -y pkg-config libxkbcommon-dev \
+  libwayland-dev libx11-dev libxcb1-dev \
+  libxi-dev libxcursor-dev libxrandr-dev libxinerama-dev \
+  libvulkan-dev mesa-vulkan-drivers
+# optional, for diagnostics: vulkan-tools  (provides `vulkaninfo`)
+```
+
+A working **Vulkan driver** is required at runtime (`mesa-vulkan-drivers` for
+Intel/AMD, or the appropriate NVIDIA driver). Fedora, Arch, and other distros
+need the equivalent X11/Wayland, `libxkbcommon`, and Vulkan development and
+runtime packages. macOS needs no extra system packages.
+
+### 3. Build
 
 ```sh
 git clone https://github.com/ishida-titech/rusmol.git
@@ -68,7 +89,7 @@ cargo build --release
 
 The optimized binary is written to `target/release/rusmol`.
 
-### 3. (Optional) Install to your PATH
+### 4. (Optional) Install to your PATH
 
 ```sh
 cargo install --path .
