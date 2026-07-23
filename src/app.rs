@@ -100,7 +100,7 @@ impl ApplicationHandler for App {
                 .create_window(
                     Window::default_attributes()
                         .with_title("RusMol")
-                        .with_inner_size(PhysicalSize::new(1600u32, 1600u32)),
+                        .with_inner_size(PhysicalSize::new(1000u32, 1000u32)),
                 )
                 .expect("Failed to create window"),
         );
