@@ -2,6 +2,16 @@
 name = "rusmol"
 version = "0.3.0"
 edition = "2021"
+rust-version = "1.80"
+authors = ["Takashi Ishida <takashi.ishida@gmail.com>"]
+description = "A Rust-based lightweight molecular structure viewer for proteins and nucleic acids, with a PyMOL-compatible command set and wgpu (Metal) rendering."
+readme = "README.md"
+repository = "https://github.com/ishida-titech/rusmol"
+homepage = "https://github.com/ishida-titech/rusmol"
+license = "MIT OR Apache-2.0"
+keywords = ["molecular", "visualization", "pdb", "bioinformatics", "wgpu"]
+categories = ["science", "visualization", "command-line-utilities"]
+exclude = ["/assets", "/tests", "/dev", "/.github"]
 
 [dependencies]
 wgpu = "24"
