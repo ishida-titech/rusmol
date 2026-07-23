@@ -141,6 +141,17 @@ impl ApplicationHandler for App {
         }
     }
 
+    /// Called by winit when the event loop is shutting down, while the window
+    /// and display connection are still valid. We terminate the process here
+    /// instead of letting `run_app` return and drop the App: on Linux/Vulkan,
+    /// tearing down the wgpu surface/device after winit has closed the X11 or
+    /// Wayland connection segfaults inside the driver. Any deferred screenshot
+    /// has already been written to disk by the time `exit()` was requested, so
+    /// skipping destructors here is safe (the OS reclaims all resources).
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        std::process::exit(0);
+    }
+
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
