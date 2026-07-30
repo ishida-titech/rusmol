@@ -345,6 +345,10 @@ impl ApplicationHandler for App {
                     if preset == 3 {
                         render.surface_alpha = 0.75;
                     }
+                    // Carve bound ligands out of the surface in the surface-showing
+                    // presets (Chain Surface, Pocket Surface) so covalent/buried
+                    // ligands are not engulfed; other presets leave it off.
+                    render.surface_carve_ligand = preset == 1 || preset == 3;
 
                     // Reset post-processing and lighting to their defaults.
                     render.bloom_threshold = 1.0;
