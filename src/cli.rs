@@ -28,4 +28,8 @@ pub struct Cli {
     /// Print verbose (info-level) diagnostics
     #[arg(short = 'v', long)]
     pub verbose: bool,
+
+    /// Run without opening a window: execute -c commands, render outputs, and exit
+    #[arg(long)]
+    pub headless: bool,
 }

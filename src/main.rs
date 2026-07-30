@@ -93,6 +93,11 @@ fn main() -> anyhow::Result<()> {
         .map(String::from)
         .collect();
 
+    // ── Headless mode: no window, no event loop. Execute -c, export, exit. ──
+    if cli.headless {
+        return run_headless(scene, initial_commands);
+    }
+
     log::info!("starting event loop");
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -114,6 +119,82 @@ fn main() -> anyhow::Result<()> {
 
     let mut app = app::App::new(scene, cmd_rx, resp_tx, initial_commands);
     event_loop.run_app(&mut app)?;
+
+    Ok(())
+}
+
+/// Headless (no-window) runner. Builds an offscreen [`RenderState`], applies the
+/// `-c` commands via the shared [`app::apply_command`], writes any `render`/`png`
+/// outputs to disk, then returns. Never touches winit, so it works with no
+/// display server.
+fn run_headless(mut scene: Scene, initial_commands: Vec<String>) -> anyhow::Result<()> {
+    use app::{apply_command, scene_bounds, CmdOutcome};
+    use command::{parser::parse_command, CommandResponse};
+    use glam::Vec2;
+    use render::{camera::Camera, state::RenderState};
+    use scene::SceneDirty;
+
+    if initial_commands.is_empty() {
+        eprintln!("Error: --headless requires -c \"...\" with at least one command");
+        std::process::exit(1);
+    }
+
+    let mut render = pollster::block_on(RenderState::new_headless(1000, 1000))?;
+    render.upload_scene(&scene, SceneDirty::ALL);
+
+    // Camera framing matches the windowed `resumed` path (1000×1000 viewport).
+    let (centroid, radius) = scene_bounds(&scene);
+    let mut camera = Camera::new(centroid, radius * 2.5, Vec2::new(1000.0, 1000.0));
+    camera.far = radius * 20.0;
+    camera.near = radius * 0.01;
+
+    let mut scene_dirty = SceneDirty::NONE;
+
+    // Flush any pending geometry changes before an export/screenshot so the
+    // capture reflects all preceding commands.
+    let flush = |render: &mut RenderState, scene: &Scene, dirty: &mut SceneDirty| {
+        if !dirty.is_empty() {
+            render.upload_scene(scene, *dirty);
+            *dirty = SceneDirty::NONE;
+        }
+    };
+
+    for line in &initial_commands {
+        let cmd = match parse_command(line) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Parse error: {e}");
+                continue;
+            }
+        };
+        match apply_command(cmd, &mut scene, &mut render, &mut camera, &mut scene_dirty) {
+            CmdOutcome::Handled => {}
+            CmdOutcome::Quit => break,
+            CmdOutcome::Printed(response) => match response {
+                CommandResponse::Ok(msg) if !msg.is_empty() => println!("{msg}"),
+                CommandResponse::Error(msg) => eprintln!("Error: {msg}"),
+                _ => {}
+            },
+            CmdOutcome::Render(path, w, h) => {
+                flush(&mut render, &scene, &mut scene_dirty);
+                // No dims → 1000²; only width → square; both → as given
+                // (matches the windowed `render` semantics).
+                let out_w = w.unwrap_or(1000);
+                let out_h = h.or(w).unwrap_or(1000);
+                if let Err(e) = render.export(&mut camera, out_w, out_h, &path) {
+                    eprintln!("render: {e}");
+                }
+            }
+            CmdOutcome::Screenshot(path) => {
+                flush(&mut render, &scene, &mut scene_dirty);
+                // No swapchain in headless: `png` exports at the config size.
+                let (w, h) = (render.config.width, render.config.height);
+                if let Err(e) = render.export(&mut camera, w, h, &path) {
+                    eprintln!("png: {e}");
+                }
+            }
+        }
+    }
 
     Ok(())
 }

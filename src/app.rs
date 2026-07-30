@@ -693,136 +693,18 @@ impl App {
         use crate::command::parser::parse_command;
         match parse_command(line) {
             Ok(cmd) => {
-                // Quit via -c: defer to about_to_wait so screenshots can complete
-                if matches!(cmd, Command::Quit) {
-                    self.pending_quit = true;
-                    return;
-                }
-                // Background / Light are handled here rather than in executor (need render access)
-                if let Command::Background(rgb) = cmd {
-                    if let AppState::Running { render, .. } = &mut self.state {
-                        render.bg_color = wgpu::Color {
-                            r: rgb[0] as f64,
-                            g: rgb[1] as f64,
-                            b: rgb[2] as f64,
-                            a: 1.0,
-                        };
-                    }
-                    return;
-                }
-                if let Command::Light { intensity, elevation, azimuth } = cmd {
-                    if let AppState::Running { render, window, .. } = &mut self.state {
-                        if let Some(v) = intensity { render.light_intensity    = v; }
-                        if let Some(v) = elevation { render.light_elevation_deg = v; }
-                        if let Some(v) = azimuth   { render.light_azimuth_deg   = v; }
-                        window.request_redraw();
-                    }
-                    return;
-                }
-                if let Command::Light2 { intensity, elevation, azimuth } = cmd {
-                    if let AppState::Running { render, window, .. } = &mut self.state {
-                        if let Some(v) = intensity { render.light2_intensity    = v; }
-                        if let Some(v) = elevation { render.light2_elevation_deg = v; }
-                        if let Some(v) = azimuth   { render.light2_azimuth_deg   = v; }
-                        window.request_redraw();
-                    }
-                    return;
-                }
-                if let Command::Set { ref name, value } = cmd {
-                    let mut need_rebuild = false;
-                    let mut need_atoms = false;
-                    if let AppState::Running { render, .. } = &mut self.state {
-                        match name.as_str() {
-                            "transparency" | "surface_transparency" => {
-                                render.surface_alpha = (1.0 - value).clamp(0.0, 1.0);
-                            }
-                            "edge_strength" => {
-                                render.edge_strength = value.max(0.0);
-                            }
-                            "roughness" => {
-                                render.roughness = value.clamp(0.0, 1.0);
-                            }
-                            "metallic" => {
-                                render.metallic = value.clamp(0.0, 1.0);
-                            }
-                            "ibl_intensity" => {
-                                render.ibl_intensity = value.max(0.0);
-                            }
-                            "shadow_strength" | "shadow" => {
-                                render.shadow_strength = value.clamp(0.0, 1.0);
-                            }
-                            "bloom_threshold" => {
-                                render.bloom_threshold = value.max(0.0);
-                            }
-                            "bloom_intensity" | "bloom" => {
-                                render.bloom_intensity = value.max(0.0);
-                            }
-                            "surface_type" => {
-                                use crate::render::surface::SurfaceType;
-                                let new_type = if value < 0.5 { SurfaceType::Gaussian } else { SurfaceType::Ses };
-                                if render.surface_type != new_type {
-                                    render.surface_type = new_type;
-                                    need_rebuild = true;
-                                }
-                            }
-                            "surface_quality" => {
-                                let new_q = value.clamp(0.2, 2.0);
-                                if (render.surface_quality - new_q).abs() > 0.01 {
-                                    render.surface_quality = new_q;
-                                    need_rebuild = true;
-                                }
-                            }
-                            "surface_smooth" => {
-                                let new_s = value.round().clamp(0.0, 100.0) as u32;
-                                if render.surface_smooth != new_s {
-                                    render.surface_smooth = new_s;
-                                    need_rebuild = true;
-                                }
-                            }
-                            "light_intensity"  => render.light_intensity     = value.max(0.0),
-                            "light_elevation"  => render.light_elevation_deg = value.clamp(-90.0, 90.0),
-                            "light_azimuth"    => render.light_azimuth_deg   = value,
-                            "light2_intensity" => render.light2_intensity     = value.max(0.0),
-                            "light2_elevation" => render.light2_elevation_deg = value.clamp(-90.0, 90.0),
-                            "light2_azimuth"   => render.light2_azimuth_deg   = value,
-                            "antialias"        => render.antialias = (value.round() as i64).clamp(1, 4) as u32,
-                            "transparent_bg"   => render.bg_transparent = value != 0.0,
-                            "ssao_samples"     => render.ssao_samples = (value.round() as i64).clamp(8, 64) as u32,
-                            "dof"              => render.dof_strength = value.clamp(0.0, 1.0),
-                            "dof_aperture"     => render.dof_aperture = value.max(0.0),
-                            "dof_focus"        => render.dof_focus = value.max(0.0),
-                            "show_covalent"    => { render.show_covalent = value != 0.0; need_atoms = true; }
-                            _ => {}
-                        }
-                    }
-                    if need_rebuild {
-                        self.scene_dirty |= SceneDirty::SURFACE;
-                    }
-                    if need_atoms {
-                        self.scene_dirty |= SceneDirty::ATOMS;
-                    }
-                    return;
-                }
-                if let Command::SetColor { ref rep, color, ref sel } = cmd {
-                    apply_set_color(&mut self.scene, rep, color, sel.as_deref());
-                    self.scene_dirty |= dirty_for_set_color(rep);
-                    return;
-                }
-                if let Command::Png { path } = cmd {
-                    self.pending_screenshot_path = Some(path);
-                    return;
-                }
-                if let Command::Render { path, width, height } = cmd {
-                    self.pending_render = Some((path, width, height));
-                    return;
-                }
-                let AppState::Running { camera, .. } = &mut self.state else { return };
-                let (response, dirty) = executor::execute(cmd, &mut self.scene, camera);
-                self.scene_dirty |= dirty;
-                match response {
-                    CommandResponse::Ok(msg) if !msg.is_empty() => println!("{msg}"),
-                    CommandResponse::Error(msg) => eprintln!("Error: {msg}"),
-                    _ => {}
+                let AppState::Running { render, camera, window } = &mut self.state else { return };
+                match apply_command(cmd, &mut self.scene, render, camera, &mut self.scene_dirty) {
+                    // Quit via -c: defer to about_to_wait so screenshots can complete
+                    CmdOutcome::Quit => self.pending_quit = true,
+                    CmdOutcome::Screenshot(path) => self.pending_screenshot_path = Some(path),
+                    CmdOutcome::Render(path, w, h) => self.pending_render = Some((path, w, h)),
+                    CmdOutcome::Handled => window.request_redraw(),
+                    CmdOutcome::Printed(response) => match response {
+                        CommandResponse::Ok(msg) if !msg.is_empty() => println!("{msg}"),
+                        CommandResponse::Error(msg) => eprintln!("Error: {msg}"),
+                        _ => {}
+                    },
                 }
             }
             Err(e) => eprintln!("Parse error: {e}"),
@@ -1346,6 +1228,151 @@ fn apply_pocket_surface_view(scene: &mut Scene) {
 /// `rep`: "surface" or "ribbon".
 /// `color`: Some(rgb) to set override, None to reset to per-atom colors.
 /// `sel`: optional object name filter; None means all objects.
+/// Result of applying a single parsed command via [`apply_command`].
+///
+/// The side-effect logic (mutating `render.*` fields, colors, scene geometry
+/// flags) lives in `apply_command`; the *I/O* consequences (printing, deferring
+/// a screenshot/render, requesting a quit) are returned here so each caller —
+/// the windowed `run_command_line` and the headless runner — can perform them in
+/// the way appropriate to its context.
+pub enum CmdOutcome {
+    /// Command fully applied; nothing further to report.
+    Handled,
+    /// A `quit` was issued.
+    Quit,
+    /// A `png` screenshot was requested at the given path.
+    Screenshot(std::path::PathBuf),
+    /// A `render` export was requested: (path, width, height).
+    Render(std::path::PathBuf, Option<u32>, Option<u32>),
+    /// A generic command ran through the executor and produced a response to print.
+    Printed(CommandResponse),
+}
+
+/// Apply one parsed command's side effects, shared by the windowed `-c` path and
+/// the headless runner. Mutates `render` fields, scene colors, and OR-s into
+/// `scene_dirty`; returns a [`CmdOutcome`] describing any deferred I/O.
+///
+/// This mirrors the per-command logic historically inlined in
+/// `run_command_line`. The interactive `about_to_wait` path keeps its own copy
+/// because it also drives the prompt-response channel and dock-trace commands.
+pub fn apply_command(
+    cmd: Command,
+    scene: &mut Scene,
+    render: &mut RenderState,
+    camera: &mut Camera,
+    scene_dirty: &mut SceneDirty,
+) -> CmdOutcome {
+    match cmd {
+        Command::Quit => CmdOutcome::Quit,
+        Command::Background(rgb) => {
+            render.bg_color = wgpu::Color {
+                r: rgb[0] as f64,
+                g: rgb[1] as f64,
+                b: rgb[2] as f64,
+                a: 1.0,
+            };
+            CmdOutcome::Handled
+        }
+        Command::Light { intensity, elevation, azimuth } => {
+            if let Some(v) = intensity { render.light_intensity     = v; }
+            if let Some(v) = elevation { render.light_elevation_deg = v; }
+            if let Some(v) = azimuth   { render.light_azimuth_deg   = v; }
+            CmdOutcome::Handled
+        }
+        Command::Light2 { intensity, elevation, azimuth } => {
+            if let Some(v) = intensity { render.light2_intensity     = v; }
+            if let Some(v) = elevation { render.light2_elevation_deg = v; }
+            if let Some(v) = azimuth   { render.light2_azimuth_deg   = v; }
+            CmdOutcome::Handled
+        }
+        Command::Set { ref name, value } => {
+            let mut need_rebuild = false;
+            let mut need_atoms = false;
+            match name.as_str() {
+                "transparency" | "surface_transparency" => {
+                    render.surface_alpha = (1.0 - value).clamp(0.0, 1.0);
+                }
+                "edge_strength" => {
+                    render.edge_strength = value.max(0.0);
+                }
+                "roughness" => {
+                    render.roughness = value.clamp(0.0, 1.0);
+                }
+                "metallic" => {
+                    render.metallic = value.clamp(0.0, 1.0);
+                }
+                "ibl_intensity" => {
+                    render.ibl_intensity = value.max(0.0);
+                }
+                "shadow_strength" | "shadow" => {
+                    render.shadow_strength = value.clamp(0.0, 1.0);
+                }
+                "bloom_threshold" => {
+                    render.bloom_threshold = value.max(0.0);
+                }
+                "bloom_intensity" | "bloom" => {
+                    render.bloom_intensity = value.max(0.0);
+                }
+                "surface_type" => {
+                    use crate::render::surface::SurfaceType;
+                    let new_type = if value < 0.5 { SurfaceType::Gaussian } else { SurfaceType::Ses };
+                    if render.surface_type != new_type {
+                        render.surface_type = new_type;
+                        need_rebuild = true;
+                    }
+                }
+                "surface_quality" => {
+                    let new_q = value.clamp(0.2, 2.0);
+                    if (render.surface_quality - new_q).abs() > 0.01 {
+                        render.surface_quality = new_q;
+                        need_rebuild = true;
+                    }
+                }
+                "surface_smooth" => {
+                    let new_s = value.round().clamp(0.0, 100.0) as u32;
+                    if render.surface_smooth != new_s {
+                        render.surface_smooth = new_s;
+                        need_rebuild = true;
+                    }
+                }
+                "light_intensity"  => render.light_intensity     = value.max(0.0),
+                "light_elevation"  => render.light_elevation_deg = value.clamp(-90.0, 90.0),
+                "light_azimuth"    => render.light_azimuth_deg   = value,
+                "light2_intensity" => render.light2_intensity     = value.max(0.0),
+                "light2_elevation" => render.light2_elevation_deg = value.clamp(-90.0, 90.0),
+                "light2_azimuth"   => render.light2_azimuth_deg   = value,
+                "antialias"        => render.antialias = (value.round() as i64).clamp(1, 4) as u32,
+                "transparent_bg"   => render.bg_transparent = value != 0.0,
+                "ssao_samples"     => render.ssao_samples = (value.round() as i64).clamp(8, 64) as u32,
+                "dof"              => render.dof_strength = value.clamp(0.0, 1.0),
+                "dof_aperture"     => render.dof_aperture = value.max(0.0),
+                "dof_focus"        => render.dof_focus = value.max(0.0),
+                "show_covalent"    => { render.show_covalent = value != 0.0; need_atoms = true; }
+                _ => {}
+            }
+            if need_rebuild {
+                *scene_dirty |= SceneDirty::SURFACE;
+            }
+            if need_atoms {
+                *scene_dirty |= SceneDirty::ATOMS;
+            }
+            CmdOutcome::Handled
+        }
+        Command::SetColor { ref rep, color, ref sel } => {
+            apply_set_color(scene, rep, color, sel.as_deref());
+            *scene_dirty |= dirty_for_set_color(rep);
+            CmdOutcome::Handled
+        }
+        Command::Png { path } => CmdOutcome::Screenshot(path),
+        Command::Render { path, width, height } => CmdOutcome::Render(path, width, height),
+        other => {
+            let (response, dirty) = executor::execute(other, scene, camera);
+            *scene_dirty |= dirty;
+            CmdOutcome::Printed(response)
+        }
+    }
+}
+
 fn dirty_for_set_color(rep: &str) -> SceneDirty {
     match rep {
         "surface" => SceneDirty::SURFACE,
@@ -1369,7 +1396,7 @@ fn apply_set_color(scene: &mut Scene, rep: &str, color: Option<[f32; 3]>, sel: O
     }
 }
 
-fn scene_bounds(scene: &Scene) -> (glam::Vec3, f32) {
+pub fn scene_bounds(scene: &Scene) -> (glam::Vec3, f32) {
     let mut min = glam::Vec3::splat(f32::MAX);
     let mut max = glam::Vec3::splat(f32::MIN);
     let mut count = 0usize;

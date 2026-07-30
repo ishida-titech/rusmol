@@ -43,6 +43,7 @@ rusmol [OPTIONS] <FILES>...
 |--------|-------|-------------|
 | `<FILES>...` | | PDB files to load (required, one or more) |
 | `--command <CMD>` | `-c` | Commands to execute on startup (`;` separated) |
+| `--headless` | | Run without a window: execute `-c` commands, render outputs, and exit |
 | `--verbose` | `-v` | Enable verbose logging |
 | `--version` | | Print version |
 | `--help` | | Print help |
@@ -54,7 +55,17 @@ rusmol 1crn.pdb
 rusmol -v 2je5.pdb
 rusmol -c "show surface; color chain" 1abc.pdb
 rusmol -c "hide ribbon; show lines" file1.pdb file2.pdb
+rusmol --headless -c "show surface; color chain; render fig.png, 2400; quit" 2je5.pdb
 ```
+
+### Headless mode
+
+`--headless` runs without opening a window or event loop: it applies the `-c`
+commands, writes any `render` / `png` output offscreen, and exits. It needs no
+display server, so it works in scripts, batch jobs, and CI. It requires `-c`
+(there is nothing to do interactively). In headless mode `png` writes an
+offscreen image at the default 1000×1000 size; use `render <file>, W, H` for an
+explicit resolution.
 
 ---
 

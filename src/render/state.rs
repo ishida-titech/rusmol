@@ -233,7 +233,9 @@ impl RenderTargets {
 }
 
 pub struct RenderState {
-    pub surface: wgpu::Surface<'static>,
+    /// The swapchain surface. `None` in headless mode (no window); rendering to
+    /// the swapchain is then a no-op and only offscreen `export` is used.
+    pub surface: Option<wgpu::Surface<'static>>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
@@ -465,6 +467,65 @@ impl RenderState {
         };
         surface.configure(&device, &config);
 
+        Ok(Self::build(device, queue, config, Some(surface)))
+    }
+
+    /// Create a headless (no-window) render state. Uses the same offscreen
+    /// pipelines as [`new`]; there is no swapchain surface, so only `export`
+    /// produces output. `width`/`height` set the default capture size (via the
+    /// config); an actual surface is never created, so this works with no
+    /// display server.
+    pub async fn new_headless(width: u32, height: u32) -> anyhow::Result<Self> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            ..Default::default()
+        });
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No suitable GPU adapter found"))?;
+
+        let (device, queue) = adapter
+            .request_device(
+                &wgpu::DeviceDescriptor {
+                    label: None,
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    memory_hints: wgpu::MemoryHints::default(),
+                },
+                None,
+            )
+            .await?;
+
+        // No real surface: this config only carries the capture size + format.
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            width: width.max(1),
+            height: height.max(1),
+            present_mode: wgpu::PresentMode::AutoVsync,
+            desired_maximum_frame_latency: 2,
+            alpha_mode: wgpu::CompositeAlphaMode::Opaque,
+            view_formats: vec![],
+        };
+
+        Ok(Self::build(device, queue, config, None))
+    }
+
+    /// Shared construction from a ready device/queue/config. Builds all
+    /// pipelines, offscreen targets, shadow map, and the picker. `surface` is
+    /// `Some` in windowed mode and `None` in headless mode. The color format for
+    /// the final composite/egui pass comes from `config.format`.
+    fn build(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        config: wgpu::SurfaceConfiguration,
+        surface: Option<wgpu::Surface<'static>>,
+    ) -> Self {
         // Offscreen render targets are allocated below, once the bind group
         // layouts and shared sampler they depend on exist (see `targets`).
 
@@ -1369,7 +1430,7 @@ impl RenderState {
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format,
+                    format: config.format,
                     blend: None,
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
@@ -1475,12 +1536,12 @@ impl RenderState {
         );
 
         // ── Phase 5: picker ──────────────────────────────────────────────────
-        let picker = Picker::new(&device, size.width.max(1), size.height.max(1), &uniform_bind_group_layout);
+        let picker = Picker::new(&device, config.width, config.height, &uniform_bind_group_layout);
 
         // ── egui renderer ────────────────────────────────────────────────────
-        let egui_renderer = egui_wgpu::Renderer::new(&device, format, None, 1, false);
+        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
 
-        Ok(Self {
+        Self {
             surface,
             device,
             queue,
@@ -1578,7 +1639,7 @@ impl RenderState {
             dof_strength: 0.0,
             dof_aperture: 1.0,
             dof_focus: 0.0,
-        })
+        }
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -1587,7 +1648,10 @@ impl RenderState {
         }
         self.config.width = width;
         self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
+        // resize is only called in windowed mode; guard for the headless case.
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
 
         // Rebuild the whole offscreen target set at the new resolution. The
         // bind group layouts and shared sampler are unchanged, so only the
@@ -2790,7 +2854,9 @@ impl RenderState {
         screen_desc: &egui_wgpu::ScreenDescriptor,
         textures_delta: egui::TexturesDelta,
     ) -> anyhow::Result<()> {
-        let output = match self.surface.get_current_texture() {
+        // No swapchain in headless mode: rendering to screen is a no-op.
+        let Some(surface) = self.surface.as_ref() else { return Ok(()); };
+        let output = match surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => return Ok(()),
             Err(e) => return Err(e.into()),

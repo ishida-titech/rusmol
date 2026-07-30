@@ -150,10 +150,26 @@ Arguments:
 Options:
   -c, --command <CMD>   Run a ';'-separated command string after loading,
                         then keep the prompt open
+      --headless        Run without opening a window: execute -c commands,
+                        render outputs, and exit (no display server needed)
   -v, --verbose         Print verbose (info-level) diagnostics
   -h, --help            Print help
   -V, --version         Print version
 ```
+
+### Headless rendering
+
+With `--headless`, RusMol never opens a window or event loop — it runs the
+`-c` commands, writes any `render`/`png` outputs offscreen, and exits. This is
+ideal for scripts, batch figure generation, and servers/CI without a display:
+
+```sh
+rusmol --headless tests/fixtures/2je5.pdb \
+  -c "show surface; color chain; bg white; set antialias,3; render figure.png, 2400; quit"
+```
+
+`--headless` requires `-c`. In this mode `png` writes an offscreen image at the
+default 1000×1000 size (use `render` for an explicit resolution).
 
 ## Sample data
 
