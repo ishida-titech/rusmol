@@ -478,6 +478,11 @@ impl ApplicationHandler for App {
                             "light2_elevation" => render.light2_elevation_deg = value.clamp(-90.0, 90.0),
                             "light2_azimuth"   => render.light2_azimuth_deg   = value,
                             "antialias"        => render.antialias = (value.round() as i64).clamp(1, 4) as u32,
+                            "transparent_bg"   => render.bg_transparent = value != 0.0,
+                            "ssao_samples"     => render.ssao_samples = (value.round() as i64).clamp(8, 64) as u32,
+                            "dof"              => render.dof_strength = value.clamp(0.0, 1.0),
+                            "dof_aperture"     => render.dof_aperture = value.max(0.0),
+                            "dof_focus"        => render.dof_focus = value.max(0.0),
                             _ => {}
                         }
                         window.request_redraw();
@@ -775,6 +780,11 @@ impl App {
                             "light2_elevation" => render.light2_elevation_deg = value.clamp(-90.0, 90.0),
                             "light2_azimuth"   => render.light2_azimuth_deg   = value,
                             "antialias"        => render.antialias = (value.round() as i64).clamp(1, 4) as u32,
+                            "transparent_bg"   => render.bg_transparent = value != 0.0,
+                            "ssao_samples"     => render.ssao_samples = (value.round() as i64).clamp(8, 64) as u32,
+                            "dof"              => render.dof_strength = value.clamp(0.0, 1.0),
+                            "dof_aperture"     => render.dof_aperture = value.max(0.0),
+                            "dof_focus"        => render.dof_focus = value.max(0.0),
                             _ => {}
                         }
                     }
@@ -1399,6 +1409,11 @@ fn format_get_params(render: &RenderState, name: Option<&str>) -> String {
         ("light2_elevation", format!("{:.1}", render.light2_elevation_deg)),
         ("light2_azimuth",   format!("{:.1}", render.light2_azimuth_deg)),
         ("antialias",        format!("{}", render.antialias)),
+        ("transparent_bg",   format!("{}", render.bg_transparent as u32)),
+        ("ssao_samples",     format!("{}", render.ssao_samples)),
+        ("dof",              format!("{:.2}", render.dof_strength)),
+        ("dof_aperture",     format!("{:.2}", render.dof_aperture)),
+        ("dof_focus",        format!("{:.2}", render.dof_focus)),
     ];
 
     match name {

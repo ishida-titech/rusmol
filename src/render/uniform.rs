@@ -32,7 +32,13 @@ pub struct Uniforms {
     pub light2_dir:        [f32; 2],      // offset 328,  8 bytes (xy; z is in next row)
     pub light2_dir_z:      f32,           // offset 336,  4 bytes
     pub light2_intensity:  f32,           // offset 340,  4 bytes
-    pub _pad_end:          [f32; 2],      // offset 344,  8 bytes → total 352 bytes (aligned to 16)
+    // ── High-quality export / post-process controls (append-only) ─────────────
+    pub bg_transparent:    u32,           // offset 344,  4 bytes (0=opaque bg, 1=alpha)
+    pub ssao_samples:      u32,           // offset 348,  4 bytes (SSAO tap count)
+    pub dof_strength:      f32,           // offset 352,  4 bytes (0 = DoF off)
+    pub dof_focus:         f32,           // offset 356,  4 bytes (world-space focus distance)
+    pub dof_aperture:      f32,           // offset 360,  4 bytes (blur scale)
+    pub _pad_end:          [f32; 1],      // offset 364,  4 bytes → total 368 bytes (aligned to 16)
 }
 
 impl Uniforms {
@@ -60,6 +66,11 @@ impl Uniforms {
         bloom_intensity: f32,
         light2_dir: Vec3,
         light2_intensity: f32,
+        bg_transparent: u32,
+        ssao_samples: u32,
+        dof_strength: f32,
+        dof_focus: f32,
+        dof_aperture: f32,
     ) -> Self {
         Self {
             view_proj: view_proj.to_cols_array_2d(),
@@ -86,7 +97,12 @@ impl Uniforms {
             light2_dir: [light2_dir.normalize().x, light2_dir.normalize().y],
             light2_dir_z: light2_dir.normalize().z,
             light2_intensity,
-            _pad_end: [0.0; 2],
+            bg_transparent,
+            ssao_samples,
+            dof_strength,
+            dof_focus,
+            dof_aperture,
+            _pad_end: [0.0; 1],
         }
     }
 }

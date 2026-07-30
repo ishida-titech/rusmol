@@ -378,6 +378,11 @@ fn help_text() -> String {
    set surface_quality, <0.2-2> Grid resolution in Å (smaller=finer, default=0.5)
    set surface_smooth, <0-100>  Surface smoothing iterations (higher=smoother, default=6)
    set antialias, <1-4>         Supersampling factor for `render` export (default=2)
+   set ssao_samples, <8-64>     SSAO sample count (default=16; export uses ≥32)
+   set transparent_bg, <0|1>    Transparent background in exported PNGs (default=0)
+   set dof, <0-1>               Depth-of-field strength (0=off, default=0)
+   set dof_aperture, <f>        Depth-of-field blur scale (default=1.0)
+   set dof_focus, <f>           Depth-of-field focus distance in Å (0=auto)
    set surface_color, <color> [, obj]   Fix the surface color
    set cartoon_color, <color> [, obj]   Fix the ribbon color
    set surface_color, default [, obj]   Restore the original atom colors

@@ -25,6 +25,10 @@ struct Uniforms {
     light_view_proj:   mat4x4<f32>,
     bloom_threshold:   f32,         // offset 320
     bloom_intensity:   f32,         // offset 324
+    light2_dir:        vec2<f32>,   // offset 328
+    light2_dir_z:      f32,         // offset 336
+    light2_intensity:  f32,         // offset 340
+    bg_transparent:    u32,         // offset 344
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -93,12 +97,16 @@ fn fs_main(in: VertOut) -> @location(0) vec4<f32> {
     // True background pixels keep alpha=0 and bypass tone mapping so bg_color
     // is reproduced exactly on screen.
     if scene.a < 0.001 {
+        // Transparent-background export: emit alpha 0 so the PNG has a clear
+        // background. Keep bg_color.rgb (and any bloom bleed) in the RGB channels
+        // so premultiplied downsampling stays well-defined at silhouettes.
+        let bg_alpha = select(1.0, 0.0, u.bg_transparent != 0u);
         // Still apply bloom on background (glow can bleed into background)
         let bg_bloom = bloom * u.bloom_intensity;
         if dot(bg_bloom, bg_bloom) > 0.0001 {
-            return vec4<f32>(aces_tonemap(u.bg_color.rgb + bg_bloom), 1.0);
+            return vec4<f32>(aces_tonemap(u.bg_color.rgb + bg_bloom), bg_alpha);
         }
-        return vec4<f32>(u.bg_color.rgb, 1.0);
+        return vec4<f32>(u.bg_color.rgb, bg_alpha);
     }
 
     return vec4<f32>(aces_tonemap(color), 1.0);

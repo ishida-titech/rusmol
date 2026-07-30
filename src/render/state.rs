@@ -89,6 +89,7 @@ struct TargetLayouts<'a> {
     bloom_down: &'a wgpu::BindGroupLayout,
     bloom_blur: &'a wgpu::BindGroupLayout,
     post: &'a wgpu::BindGroupLayout,
+    dof: &'a wgpu::BindGroupLayout,
     sampler: &'a wgpu::Sampler,
 }
 
@@ -130,6 +131,10 @@ pub struct RenderTargets {
     bloom_b_tex: wgpu::Texture,
     bloom_b_view: wgpu::TextureView,
 
+    // ── Depth-of-field (full res; copied back over scene_color) ───────────────
+    dof_tex: wgpu::Texture,
+    dof_view: wgpu::TextureView,
+
     // ── Bind groups depending solely on the views above ──────────────────────
     depth_resolve_bg: wgpu::BindGroup,
     ssao_bg: wgpu::BindGroup,
@@ -138,6 +143,7 @@ pub struct RenderTargets {
     bloom_blur_h_bg: wgpu::BindGroup,   // reads bloom_a, writes bloom_b
     bloom_blur_v_bg: wgpu::BindGroup,   // reads bloom_b, writes bloom_a
     post_bg: wgpu::BindGroup,
+    dof_bg: wgpu::BindGroup,            // reads scene_color + depth_single
 }
 
 impl RenderTargets {
@@ -151,7 +157,10 @@ impl RenderTargets {
         let (msaa_texture, msaa_color_view) = create_msaa_color_texture(device, width, height);
         let (scene_color_tex, scene_color_view) = create_rgba16float_texture(
             device, width, height, 1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            // COPY_DST so the DoF pass result (dof_tex) can be copied back over it.
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST,
             "SceneColor",
         );
         let (depth_single_tex, depth_single_view) = create_depth_single_texture(device, width, height);
@@ -163,6 +172,15 @@ impl RenderTargets {
         let bloom_half_h = (height / 2).max(1);
         let (bloom_a_tex, bloom_a_view) = create_bloom_texture(device, bloom_half_w, bloom_half_h, "BloomA");
         let (bloom_b_tex, bloom_b_view) = create_bloom_texture(device, bloom_half_w, bloom_half_h, "BloomB");
+
+        // DoF target: full-res HDR, copyable back onto scene_color.
+        let (dof_tex, dof_view) = create_rgba16float_texture(
+            device, width, height, 1,
+            wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC,
+            "DoF",
+        );
 
         let depth_resolve_bg = create_depth_resolve_bg(device, l.depth_resolve, &depth_view);
         let ssao_bg = create_ssao_bg(device, l.ssao, &depth_single_view, l.sampler);
@@ -177,6 +195,7 @@ impl RenderTargets {
             &scene_color_view, &ssao_blur_view, &depth_single_view, l.sampler,
             &bloom_a_view,
         );
+        let dof_bg = create_dof_bg(device, l.dof, &scene_color_view, &depth_single_view, l.sampler);
 
         Self {
             depth_texture,
@@ -195,6 +214,8 @@ impl RenderTargets {
             bloom_a_view,
             bloom_b_tex,
             bloom_b_view,
+            dof_tex,
+            dof_view,
             depth_resolve_bg,
             ssao_bg,
             ssao_blur_bg,
@@ -202,6 +223,7 @@ impl RenderTargets {
             bloom_blur_h_bg,
             bloom_blur_v_bg,
             post_bg,
+            dof_bg,
         }
     }
 }
@@ -259,12 +281,14 @@ pub struct RenderState {
     ssao_pipeline: wgpu::RenderPipeline,
     post_pipeline: wgpu::RenderPipeline,
     ssao_blur_pipeline: wgpu::RenderPipeline,
+    dof_pipeline: wgpu::RenderPipeline,
 
     // ── Bind group layouts (the bind groups themselves live in `targets`) ─────
     depth_resolve_bgl: wgpu::BindGroupLayout,
     ssao_bgl: wgpu::BindGroupLayout,
     ssao_blur_bgl: wgpu::BindGroupLayout,
     post_bgl: wgpu::BindGroupLayout,
+    dof_bgl: wgpu::BindGroupLayout,
 
     // ── Shared sampler ────────────────────────────────────────────────────────
     linear_sampler: wgpu::Sampler,
@@ -336,6 +360,13 @@ pub struct RenderState {
     shadow_uniform_buffer: wgpu::Buffer,
     shadow_uniform_bg: wgpu::BindGroup,
     shadow_bg: wgpu::BindGroup,            // group 1 for main shaders
+    /// Layout + sampler retained so `export` can rebuild `shadow_bg` at a
+    /// temporarily higher shadow-map resolution.
+    shadow_bgl: wgpu::BindGroupLayout,
+    shadow_sampler: wgpu::Sampler,
+    /// Live shadow-map resolution (default [`SHADOW_MAP_SIZE`]). `export` renders
+    /// with a temporary 4096² map for sharper shadows, then restores this.
+    pub shadow_map_size: u32,
     shadow_impostor_pipeline: wgpu::RenderPipeline,
     shadow_cylinder_pipeline: wgpu::RenderPipeline,
     shadow_mesh_pipeline: wgpu::RenderPipeline,
@@ -359,6 +390,20 @@ pub struct RenderState {
     /// (not a shader uniform): the scene is rendered at `antialias`× resolution
     /// and box-downsampled. Default 2. Set via `set antialias, <1-4>`.
     pub antialias: u32,
+
+    /// Transparent background for exported PNGs (default false). Set via
+    /// `set transparent_bg, 0|1`. On-screen the swapchain ignores alpha.
+    pub bg_transparent: bool,
+    /// SSAO sample count (clamped 8..=64, default 16 = the previous hardcoded
+    /// value). Set via `set ssao_samples, N`.
+    pub ssao_samples: u32,
+    /// Depth-of-field strength (0 = off, default 0). Set via `set dof, <0-1>`.
+    pub dof_strength: f32,
+    /// Depth-of-field blur scale (default 1.0). Set via `set dof_aperture, <f>`.
+    pub dof_aperture: f32,
+    /// Depth-of-field focus distance in Å from the camera; 0 = auto (distance to
+    /// the scene center). Set via `set dof_focus, <f>`.
+    pub dof_focus: f32,
 }
 
 impl RenderState {
@@ -428,17 +473,8 @@ impl RenderState {
         });
 
         // ── Shadow map ─────────────────────────────────────────────────────
-        let shadow_map_tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("ShadowMapTex"),
-            size: wgpu::Extent3d { width: SHADOW_MAP_SIZE, height: SHADOW_MAP_SIZE, depth_or_array_layers: 1 },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Depth32Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let shadow_map_view = shadow_map_tex.create_view(&Default::default());
+        let (_shadow_map_tex, shadow_map_view) =
+            create_shadow_map_texture(&device, SHADOW_MAP_SIZE);
         let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("ShadowSampler"),
             compare: Some(wgpu::CompareFunction::Less),
@@ -503,14 +539,7 @@ impl RenderState {
                 },
             ],
         });
-        let shadow_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ShadowBG"),
-            layout: &shadow_bgl,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&shadow_map_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&shadow_sampler) },
-            ],
-        });
+        let shadow_bg = create_shadow_bg(&device, &shadow_bgl, &shadow_map_view, &shadow_sampler);
 
         // ── Uniform buffer ───────────────────────────────────────────────────
         let screen_size = [config.width as f32, config.height as f32];
@@ -538,6 +567,11 @@ impl RenderState {
             0.0,   // bloom_intensity (off by default)
             glam::Vec3::ZERO, // light2_dir
             0.0,              // light2_intensity (off by default)
+            0,     // bg_transparent
+            16,    // ssao_samples
+            0.0,   // dof_strength (off)
+            0.0,   // dof_focus (auto)
+            1.0,   // dof_aperture
         );
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Uniforms"),
@@ -1342,6 +1376,79 @@ impl RenderState {
             cache: None,
         });
 
+        // ── Depth-of-field pipeline ───────────────────────────────────────────
+        let dof_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("DoFBGL"),
+            entries: &[
+                // scene_tex (binding 0)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // depth_tex (binding 1)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                // sampler (binding 2)
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let dof_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("DoFPipelineLayout"),
+            bind_group_layouts: &[&uniform_bind_group_layout, &dof_bgl],
+            push_constant_ranges: &[],
+        });
+        let dof_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("DoFShader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/dof.wgsl").into()),
+        });
+        let dof_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("DoFPipeline"),
+            layout: Some(&dof_layout),
+            vertex: wgpu::VertexState {
+                module: &dof_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &dof_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba16Float,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+            multiview: None,
+            cache: None,
+        });
+
         // ── Offscreen render targets (all layouts + sampler now exist) ────────
         let targets = RenderTargets::new(
             &device,
@@ -1354,6 +1461,7 @@ impl RenderState {
                 bloom_down: &bloom_down_bgl,
                 bloom_blur: &bloom_blur_bgl,
                 post: &post_bgl,
+                dof: &dof_bgl,
                 sampler: &linear_sampler,
             },
         );
@@ -1400,10 +1508,12 @@ impl RenderState {
             ssao_pipeline,
             post_pipeline,
             ssao_blur_pipeline,
+            dof_pipeline,
             depth_resolve_bgl,
             ssao_bgl,
             ssao_blur_bgl,
             post_bgl,
+            dof_bgl,
             linear_sampler,
             picker,
             sphere_instance_map: Vec::new(),
@@ -1438,6 +1548,9 @@ impl RenderState {
             shadow_uniform_buffer,
             shadow_uniform_bg,
             shadow_bg,
+            shadow_bgl,
+            shadow_sampler,
+            shadow_map_size: SHADOW_MAP_SIZE,
             shadow_impostor_pipeline,
             shadow_cylinder_pipeline,
             shadow_mesh_pipeline,
@@ -1451,6 +1564,11 @@ impl RenderState {
             egui_renderer,
             pending_screenshot: None,
             antialias: 2,
+            bg_transparent: false,
+            ssao_samples: 16,
+            dof_strength: 0.0,
+            dof_aperture: 1.0,
+            dof_focus: 0.0,
         })
     }
 
@@ -1480,6 +1598,7 @@ impl RenderState {
             bloom_down: &self.bloom_down_bgl,
             bloom_blur: &self.bloom_blur_bgl,
             post: &self.post_bgl,
+            dof: &self.dof_bgl,
             sampler: &self.linear_sampler,
         }
     }
@@ -2036,6 +2155,13 @@ impl RenderState {
         };
         self.queue.write_buffer(&self.shadow_uniform_buffer, 0, bytemuck::bytes_of(&shadow_u));
 
+        // Resolve auto depth-of-field focus (0 → distance from camera to scene center).
+        let dof_focus = if self.dof_focus > 0.0 {
+            self.dof_focus
+        } else {
+            (camera.eye_position() - self.scene_center).length()
+        };
+
         let uniforms = Uniforms::new(
             proj * view,
             inv_proj,
@@ -2060,6 +2186,11 @@ impl RenderState {
             self.bloom_intensity,
             light2_dir,
             self.light2_intensity,
+            self.bg_transparent as u32,
+            self.ssao_samples.clamp(8, 64),
+            self.dof_strength,
+            dof_focus,
+            self.dof_aperture,
         );
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -2392,6 +2523,48 @@ impl RenderState {
                 pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..self.surface_index_count, 0, 0..1);
             }
+        }
+
+        // ── Pass 3.5: Depth of field ─────────────────────────────────────────
+        // Only when enabled; otherwise the encoder is byte-identical to before.
+        // Blurs scene_color into dof_tex (using resolved depth) then copies the
+        // result back over scene_color so all downstream passes see the DoF'd
+        // color unchanged.
+        if self.dof_strength > 0.0 {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("DoFPass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &targets.dof_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    ..Default::default()
+                });
+                pass.set_pipeline(&self.dof_pipeline);
+                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                pass.set_bind_group(1, &targets.dof_bg, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &targets.dof_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &targets.scene_color_tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                targets.dof_tex.size(),
+            );
         }
 
         // ── Pass 4: SSAO pass ───────────────────────────────────────────────
@@ -2759,6 +2932,20 @@ impl RenderState {
         });
         let capture_view = capture_tex.create_view(&Default::default());
 
+        // Temporarily bump shadow-map resolution and SSAO quality for the export
+        // frame only; the live window resources are swapped back before returning.
+        const EXPORT_SHADOW_SIZE: u32 = 4096;
+        let (hi_shadow_tex, hi_shadow_view) =
+            create_shadow_map_texture(&self.device, EXPORT_SHADOW_SIZE);
+        let hi_shadow_bg =
+            create_shadow_bg(&self.device, &self.shadow_bgl, &hi_shadow_view, &self.shadow_sampler);
+        let saved_shadow_view = std::mem::replace(&mut self.shadow_map_view, hi_shadow_view);
+        let saved_shadow_bg = std::mem::replace(&mut self.shadow_bg, hi_shadow_bg);
+        let saved_shadow_size = self.shadow_map_size;
+        self.shadow_map_size = EXPORT_SHADOW_SIZE;
+        let saved_ssao = self.ssao_samples;
+        self.ssao_samples = self.ssao_samples.max(32);
+
         // Write uniforms at the supersampled resolution, with projection aspect
         // set to out_w/out_h (the ratio is preserved by the ×ss factor).
         let saved_viewport = camera.viewport;
@@ -2799,6 +2986,15 @@ impl RenderState {
             wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
         );
         self.queue.submit([encoder.finish()]);
+
+        // Restore the live-resolution shadow resources and SSAO quality. The
+        // hi-res shadow texture stays alive (local `hi_shadow_tex`) until the
+        // submitted commands referencing it have been consumed.
+        self.shadow_map_view = saved_shadow_view;
+        self.shadow_bg = saved_shadow_bg;
+        self.shadow_map_size = saved_shadow_size;
+        self.ssao_samples = saved_ssao;
+        drop(hi_shadow_tex);
 
         // Restore live uniforms so the next on-screen frame renders correctly.
         self.update_uniforms(camera);
@@ -2844,7 +3040,7 @@ impl RenderState {
         let out = if ss == 1 {
             hires
         } else {
-            downsample_srgb(&hires, rw, out_w, out_h, ss)
+            downsample_srgb(&hires, rw, out_w, out_h, ss, self.bg_transparent)
         };
 
         let img = image::RgbaImage::from_raw(out_w, out_h, out)
@@ -2867,8 +3063,15 @@ fn linear_to_srgb(c: f32) -> f32 {
 
 /// Box-downsample an `rw`-wide RGBA8 (sRGB-encoded) buffer by `ss`×`ss` into an
 /// `out_w`×`out_h` buffer. RGB is averaged in linear light (correct for sRGB
-/// textures); alpha is averaged directly.
-fn downsample_srgb(src: &[u8], rw: u32, out_w: u32, out_h: u32, ss: u32) -> Vec<u8> {
+/// textures).
+///
+/// When `transparent`, color is accumulated **premultiplied** (linear RGB × α)
+/// and normalized by the alpha sum, so partially-covered silhouette pixels do
+/// not pull the (transparent) background color into the edge — this removes the
+/// dark/bright fringing you would get from a straight average. When not
+/// transparent, this is the exact straight-average behavior as before (alpha is
+/// averaged directly), preserving pixel-identical opaque output.
+fn downsample_srgb(src: &[u8], rw: u32, out_w: u32, out_h: u32, ss: u32, transparent: bool) -> Vec<u8> {
     let mut out = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
     let n = (ss * ss) as f32;
     for oy in 0..out_h {
@@ -2879,16 +3082,31 @@ fn downsample_srgb(src: &[u8], rw: u32, out_w: u32, out_h: u32, ss: u32) -> Vec<
                     let sx = ox * ss + dx;
                     let sy = oy * ss + dy;
                     let i = ((sy * rw + sx) * 4) as usize;
-                    r += srgb_to_linear(src[i] as f32 / 255.0);
-                    g += srgb_to_linear(src[i + 1] as f32 / 255.0);
-                    b += srgb_to_linear(src[i + 2] as f32 / 255.0);
-                    a += src[i + 3] as f32 / 255.0;
+                    let lr = srgb_to_linear(src[i] as f32 / 255.0);
+                    let lg = srgb_to_linear(src[i + 1] as f32 / 255.0);
+                    let lb = srgb_to_linear(src[i + 2] as f32 / 255.0);
+                    let la = src[i + 3] as f32 / 255.0;
+                    if transparent {
+                        r += lr * la;
+                        g += lg * la;
+                        b += lb * la;
+                    } else {
+                        r += lr;
+                        g += lg;
+                        b += lb;
+                    }
+                    a += la;
                 }
             }
             let o = ((oy * out_w + ox) * 4) as usize;
-            out[o]     = (linear_to_srgb(r / n) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-            out[o + 1] = (linear_to_srgb(g / n) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
-            out[o + 2] = (linear_to_srgb(b / n) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            let (rl, gl, bl) = if transparent {
+                if a > 0.0 { (r / a, g / a, b / a) } else { (0.0, 0.0, 0.0) }
+            } else {
+                (r / n, g / n, b / n)
+            };
+            out[o]     = (linear_to_srgb(rl) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            out[o + 1] = (linear_to_srgb(gl) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            out[o + 2] = (linear_to_srgb(bl) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
             out[o + 3] = (a / n * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
         }
     }
@@ -2970,6 +3188,58 @@ fn create_post_bg(
             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(depth_single_view) },
             wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(sampler) },
             wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(bloom_view) },
+        ],
+    })
+}
+
+fn create_dof_bg(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    scene_view: &wgpu::TextureView,
+    depth_single_view: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("DoFBG"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(scene_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_single_view) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(sampler) },
+        ],
+    })
+}
+
+/// Create a square shadow-map depth texture (+ view) at the given resolution.
+fn create_shadow_map_texture(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let tex = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("ShadowMapTex"),
+        size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Depth32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let view = tex.create_view(&Default::default());
+    (tex, view)
+}
+
+/// Build the group-1 shadow bind group (comparison-sampled depth) for the main
+/// shaders. Reused by `export` when rebuilding at a higher shadow resolution.
+fn create_shadow_bg(
+    device: &wgpu::Device,
+    bgl: &wgpu::BindGroupLayout,
+    shadow_view: &wgpu::TextureView,
+    shadow_sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("ShadowBG"),
+        layout: bgl,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(shadow_view) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(shadow_sampler) },
         ],
     })
 }

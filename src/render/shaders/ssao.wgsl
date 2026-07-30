@@ -8,7 +8,29 @@ struct Uniforms {
     light_intensity:   f32,
     inv_proj:          mat4x4<f32>,
     screen_size:       vec2<f32>,
-    _pad:              vec2<f32>,
+    surface_alpha:     f32,
+    edge_strength:     f32,
+    bg_color:          vec4<f32>,
+    camera_right:      vec3<f32>,
+    roughness:         f32,
+    camera_up:         vec3<f32>,
+    metallic:          f32,
+    sky_color:         vec3<f32>,
+    ibl_intensity:     f32,
+    ground_color:      vec3<f32>,
+    shadow_strength:   f32,
+    light_view_proj:   mat4x4<f32>,
+    bloom_threshold:   f32,
+    bloom_intensity:   f32,
+    light2_dir:        vec2<f32>,
+    light2_dir_z:      f32,
+    light2_intensity:  f32,
+    bg_transparent:    u32,
+    ssao_samples:      u32,          // offset 348
+    dof_strength:      f32,
+    dof_focus:         f32,
+    dof_aperture:      f32,
+    _pad_end:          f32,
 }
 
 @group(0) @binding(0) var<uniform> u: Uniforms;
@@ -63,7 +85,7 @@ fn fs_main(in: VertOut) -> @location(0) f32 {
 
     let rot = hash21(in.uv * 3141.59) * 6.2831853;
 
-    const N_SAMPLES: i32 = 16;
+    let N_SAMPLES: i32 = i32(clamp(u.ssao_samples, 8u, 64u));
     const MAX_RADIUS_PX: f32 = 48.0;
     const RADIUS_WS: f32 = 4.0;
     const BIAS: f32 = 0.15;

@@ -191,6 +191,7 @@ fn parse_set(rest: &str) -> Result<Command, String> {
         | "ibl_intensity" | "shadow_strength" | "shadow"
         | "bloom_threshold" | "bloom_intensity" | "bloom"
         | "surface_quality" | "surface_smooth" | "antialias"
+        | "transparent_bg" | "ssao_samples" | "dof" | "dof_aperture" | "dof_focus"
         | "light_intensity" | "light_elevation" | "light_azimuth"
         | "light2_intensity" | "light2_elevation" | "light2_azimuth" => {
             let value: f32 = val_str
