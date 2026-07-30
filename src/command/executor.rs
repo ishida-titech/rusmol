@@ -376,6 +376,7 @@ fn help_text() -> String {
    set surface_type, <type>     Surface method (gaussian / ses)
    set surface_quality, <0.2-2> Grid resolution in Å (smaller=finer, default=0.5)
    set surface_smooth, <0-100>  Surface smoothing iterations (higher=smoother, default=6)
+   set surface_carve_ligand, <0|1>  Carve bound ligands out of the surface (default=0)
    set show_covalent, <0|1>     Highlight covalent protein–ligand bonds (default=1)
    set antialias, <1-4>         Supersampling factor for `render` export (default=2)
    set ssao_samples, <8-64>     SSAO sample count (default=16; export uses ≥32)

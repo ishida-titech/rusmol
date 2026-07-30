@@ -484,6 +484,7 @@ These affect the `render` command (offline figures); see also [render](#render).
 |---------|-------|---------|-------------|
 | `surface_type` | `gaussian`, `ses` | `gaussian` | Surface algorithm |
 | `surface_quality` | 0.2 - 2.0 (A) | 0.5 | Grid step size (smaller=finer) |
+| `surface_carve_ligand` | 0 / 1 | 0 | Carve bound ligands out of the surface so they sit in a cavity instead of being engulfed (useful for covalent/buried ligands) |
 
 `surface_type` also accepts `connolly` and `molecular` as aliases for `ses`.
 

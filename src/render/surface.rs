@@ -833,6 +833,7 @@ pub fn build_surface(
     surface_type: SurfaceType,
     step: f32,
     smooth_iters: usize,
+    carve_ligand: bool,
     vertices: &mut Vec<RibbonVertex>,
     indices: &mut Vec<u32>,
 ) {
@@ -856,13 +857,36 @@ pub fn build_surface(
         return;
     }
 
+    // When carving is enabled, collect bound-ligand atoms (HETATM excluding
+    // water) whose volume will be subtracted from the protein surface density.
+    let ligand_atoms: Vec<(Vec3, f32)> = if carve_ligand {
+        structure
+            .atoms
+            .iter()
+            .filter(|a| {
+                a.is_hetatm && !matches!(a.residue.name.as_str(), "HOH" | "WAT" | "DOD")
+            })
+            .map(|a| (a.position, vdw_radius(&a.element)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     // Sort chains for deterministic output order
     let mut chains: Vec<char> = chain_atoms.keys().copied().collect();
     chains.sort();
 
     for chain_id in chains {
         let atoms_data = &chain_atoms[&chain_id];
-        build_surface_for_atoms(atoms_data, surface_type, step, smooth_iters, vertices, indices);
+        build_surface_for_atoms(
+            atoms_data,
+            surface_type,
+            step,
+            smooth_iters,
+            &ligand_atoms,
+            vertices,
+            indices,
+        );
     }
 }
 
@@ -872,6 +896,7 @@ fn build_surface_for_atoms(
     surface_type: SurfaceType,
     step: f32,
     smooth_iters: usize,
+    ligand_atoms: &[(Vec3, f32)],
     vertices: &mut Vec<RibbonVertex>,
     indices: &mut Vec<u32>,
 ) {
@@ -955,6 +980,51 @@ fn build_surface_for_atoms(
         log::debug!("close_density: sealed {n_sealed} tunnel/pit cells");
     }
     drop(colored);
+
+    // Carve bound ligands out of the surface: zero the density in every grid
+    // cell within (vdw + PROBE_RADIUS) of a ligand atom, so the opaque surface
+    // recedes to hug the ligand's own SES footprint instead of engulfing it.
+    // Done after closing (closing must not re-seal the carved cavity) and
+    // cell_color is deliberately left untouched, so the carved rim keeps its
+    // protein colour rather than turning grey.
+    if !ligand_atoms.is_empty() {
+        for (pos, vdw) in ligand_atoms {
+            let radius = vdw + PROBE_RADIUS;
+            let radius2 = radius * radius;
+            let cells_r = (radius / step).ceil() as i32 + 1;
+            let fc = (*pos - min) / step;
+            let ci = fc.x as i32;
+            let cj = fc.y as i32;
+            let ck = fc.z as i32;
+
+            for di in -cells_r..=cells_r {
+                let ii = ci + di;
+                if ii < 0 || ii >= nx as i32 { continue; }
+                let cx = min.x + (ii as f32) * step;
+                let dxf = cx - pos.x;
+                if dxf * dxf > radius2 { continue; }
+
+                for dj in -cells_r..=cells_r {
+                    let jj = cj + dj;
+                    if jj < 0 || jj >= ny as i32 { continue; }
+                    let cy = min.y + (jj as f32) * step;
+                    let dyf = cy - pos.y;
+                    if dxf * dxf + dyf * dyf > radius2 { continue; }
+
+                    for dk in -cells_r..=cells_r {
+                        let kk = ck + dk;
+                        if kk < 0 || kk >= nz as i32 { continue; }
+                        let cz = min.z + (kk as f32) * step;
+                        let dzf = cz - pos.z;
+                        if dxf * dxf + dyf * dyf + dzf * dzf > radius2 { continue; }
+
+                        let idx = (ii as usize) * ny * nz + (jj as usize) * nz + (kk as usize);
+                        density[idx] = 0.0;
+                    }
+                }
+            }
+        }
+    }
 
     // ── 5. Marching Cubes (parallelised over the ci dimension) ────────────────
     // density and cell_color are read-only from here on; share via references.

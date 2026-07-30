@@ -53,7 +53,7 @@ const COLORS: &[&str] = &[
 
 /// Setting names for `set` / `get`.
 const SETTINGS: &[&str] = &[
-    "transparency", "surface_type", "surface_quality", "surface_smooth", "surface_color",
+    "transparency", "surface_type", "surface_quality", "surface_smooth", "surface_carve_ligand", "surface_color",
     "cartoon_color", "edge_strength", "roughness", "metallic",
     "ibl_intensity", "shadow_strength", "bloom_threshold", "bloom_intensity",
     "antialias", "transparent_bg", "ssao_samples", "dof", "dof_aperture", "dof_focus",

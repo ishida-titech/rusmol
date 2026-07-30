@@ -357,6 +357,10 @@ pub struct RenderState {
     pub surface_smooth: u32,
     /// When true (Pocket Surface preset), keep only the surface facing the ligand.
     pub surface_clip_to_ligand: bool,
+    /// When true, subtract bound-ligand volume from the protein surface so a
+    /// covalent/bound ligand sits in a carved cavity instead of being engulfed.
+    /// Toggled via `set surface_carve_ligand, 0|1` (default off).
+    pub surface_carve_ligand: bool,
     /// When true (default), auto-detect covalent protein–ligand links (from
     /// CONECT/topology) and highlight them in gold, showing the partner residue
     /// as sticks. Toggled via `set show_covalent, 0|1`.
@@ -1609,6 +1613,7 @@ impl RenderState {
             surface_quality: 0.35,
             surface_smooth: 6,
             surface_clip_to_ligand: false,
+            surface_carve_ligand: false,
             show_covalent: true,
             hbond_segments: Vec::new(),
             shadow_map_view,
@@ -2115,7 +2120,7 @@ impl RenderState {
                 if obj.has_representation(RepresentationType::Surface) {
                     let rids = self.residue_ids_cache.get(obj_name).map(|v| v.as_slice()).unwrap_or(&[]);
                     let verts_start = surface_verts.len();
-                    build_surface(&obj.structure, &obj.atom_colors, rids, &obj.atom_rep_show, self.surface_type, self.surface_quality, self.surface_smooth as usize, &mut surface_verts, &mut surface_idxs);
+                    build_surface(&obj.structure, &obj.atom_colors, rids, &obj.atom_rep_show, self.surface_type, self.surface_quality, self.surface_smooth as usize, self.surface_carve_ligand, &mut surface_verts, &mut surface_idxs);
                     if let Some(col) = obj.surface_color_override {
                         for v in &mut surface_verts[verts_start..] {
                             v.color = col;

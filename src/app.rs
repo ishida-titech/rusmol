@@ -468,6 +468,13 @@ impl ApplicationHandler for App {
                                     need_rebuild = true;
                                 }
                             }
+                            "surface_carve_ligand" => {
+                                let v = value != 0.0;
+                                if render.surface_carve_ligand != v {
+                                    render.surface_carve_ligand = v;
+                                    need_rebuild = true;
+                                }
+                            }
                             "light_intensity"  => render.light_intensity     = value.max(0.0),
                             "light_elevation"  => render.light_elevation_deg = value.clamp(-90.0, 90.0),
                             "light_azimuth"    => render.light_azimuth_deg   = value,
@@ -1304,6 +1311,13 @@ pub fn apply_command(
                         need_rebuild = true;
                     }
                 }
+                "surface_carve_ligand" => {
+                    let v = value != 0.0;
+                    if render.surface_carve_ligand != v {
+                        render.surface_carve_ligand = v;
+                        need_rebuild = true;
+                    }
+                }
                 "light_intensity"  => render.light_intensity     = value.max(0.0),
                 "light_elevation"  => render.light_elevation_deg = value.clamp(-90.0, 90.0),
                 "light_azimuth"    => render.light_azimuth_deg   = value,
@@ -1400,6 +1414,7 @@ fn format_get_params(render: &RenderState, name: Option<&str>) -> String {
         ("transparency",    format!("{:.2}", 1.0 - render.surface_alpha)),
         ("surface_type",    surface_type_str.to_string()),
         ("surface_quality", format!("{:.2}", render.surface_quality)),
+        ("surface_carve_ligand", format!("{}", render.surface_carve_ligand as u8)),
         ("show_covalent",   format!("{}", render.show_covalent as u8)),
         ("edge_strength",   format!("{:.2}", render.edge_strength)),
         ("roughness",       format!("{:.2}", render.roughness)),
