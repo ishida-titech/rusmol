@@ -49,6 +49,7 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
             }
             Ok(Command::Png { path: PathBuf::from(rest) })
         }
+        "render" => parse_render(rest),
         "docktrace" => parse_docktrace(rest),
         "help" | "h" | "?" => Ok(Command::Help),
         "quit" | "q" | "exit" => Ok(Command::Quit),
@@ -189,7 +190,7 @@ fn parse_set(rest: &str) -> Result<Command, String> {
         "transparency" | "surface_transparency" | "edge_strength" | "roughness" | "metallic"
         | "ibl_intensity" | "shadow_strength" | "shadow"
         | "bloom_threshold" | "bloom_intensity" | "bloom"
-        | "surface_quality" | "surface_smooth"
+        | "surface_quality" | "surface_smooth" | "antialias"
         | "light_intensity" | "light_elevation" | "light_azimuth"
         | "light2_intensity" | "light2_elevation" | "light2_azimuth" => {
             let value: f32 = val_str
@@ -300,6 +301,32 @@ fn split_first_word(s: &str) -> (&str, &str) {
     } else {
         (s, "")
     }
+}
+
+/// Parse: `render <file> [, W [, H]]`
+/// W/H are optional; when omitted the current window inner size is used
+/// (resolved in app.rs). Given only W, the output is square (H = W).
+fn parse_render(rest: &str) -> Result<Command, String> {
+    if rest.is_empty() {
+        return Err("render: expected a file path".into());
+    }
+    let parts = split_comma(rest, 3);
+    let path = PathBuf::from(parts[0].trim());
+    if path.as_os_str().is_empty() {
+        return Err("render: expected a file path".into());
+    }
+    let parse_dim = |s: &str, which: &str| -> Result<Option<u32>, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        s.parse::<u32>()
+            .map(Some)
+            .map_err(|_| format!("render: {which} '{s}' is not a positive integer"))
+    };
+    let width = parts.get(1).map(|s| parse_dim(s, "width")).transpose()?.flatten();
+    let height = parts.get(2).map(|s| parse_dim(s, "height")).transpose()?.flatten();
+    Ok(Command::Render { path, width, height })
 }
 
 fn parse_docktrace(rest: &str) -> Result<Command, String> {

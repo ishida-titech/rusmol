@@ -79,6 +79,133 @@ fn emit_dashed_cylinders(
     }
 }
 
+/// Bind-group layouts and the shared sampler needed to build a [`RenderTargets`].
+/// The layouts and sampler live on [`RenderState`]; only the views/targets change
+/// when the resolution changes.
+struct TargetLayouts<'a> {
+    depth_resolve: &'a wgpu::BindGroupLayout,
+    ssao: &'a wgpu::BindGroupLayout,
+    ssao_blur: &'a wgpu::BindGroupLayout,
+    bloom_down: &'a wgpu::BindGroupLayout,
+    bloom_blur: &'a wgpu::BindGroupLayout,
+    post: &'a wgpu::BindGroupLayout,
+    sampler: &'a wgpu::Sampler,
+}
+
+/// All offscreen render targets plus the bind groups that depend solely on their
+/// views. Built at an arbitrary width/height so the exact same scene passes can
+/// render either to the swapchain (live) or to a hi-res capture (offline export),
+/// independent of the surface configuration. Texture formats are fixed
+/// (Rgba16Float color, Depth32Float depth, R8Unorm SSAO); bloom is half-res.
+// The owning `wgpu::Texture` handles are retained so the textures outlive their
+// views for as long as the targets are in use (matching the previous per-field
+// storage on `RenderState`); only the views/bind groups are read at draw time.
+#[allow(dead_code)]
+pub struct RenderTargets {
+    // ── MSAA depth (multisampled) ─────────────────────────────────────────────
+    pub depth_texture: wgpu::Texture,
+    pub depth_view: wgpu::TextureView,
+
+    // ── MSAA × 4 color ───────────────────────────────────────────────────────
+    msaa_texture: wgpu::Texture,
+    msaa_color_view: wgpu::TextureView,
+
+    // ── Opaque scene resolve target (Rgba16Float, sample_count=1) ─────────────
+    scene_color_tex: wgpu::Texture,
+    scene_color_view: wgpu::TextureView,
+
+    // ── Single-sample depth for post-process sampling ─────────────────────────
+    depth_single_tex: wgpu::Texture,
+    depth_single_view: wgpu::TextureView,
+
+    // ── SSAO textures ─────────────────────────────────────────────────────────
+    ssao_tex: wgpu::Texture,
+    ssao_view: wgpu::TextureView,
+    ssao_blur_tex: wgpu::Texture,
+    ssao_blur_view: wgpu::TextureView,
+
+    // ── Bloom (half-res) ─────────────────────────────────────────────────────
+    bloom_a_tex: wgpu::Texture,
+    bloom_a_view: wgpu::TextureView,
+    bloom_b_tex: wgpu::Texture,
+    bloom_b_view: wgpu::TextureView,
+
+    // ── Bind groups depending solely on the views above ──────────────────────
+    depth_resolve_bg: wgpu::BindGroup,
+    ssao_bg: wgpu::BindGroup,
+    ssao_blur_bg: wgpu::BindGroup,
+    bloom_down_bg: wgpu::BindGroup,
+    bloom_blur_h_bg: wgpu::BindGroup,   // reads bloom_a, writes bloom_b
+    bloom_blur_v_bg: wgpu::BindGroup,   // reads bloom_b, writes bloom_a
+    post_bg: wgpu::BindGroup,
+}
+
+impl RenderTargets {
+    /// Allocate every offscreen target and its dependent bind groups at
+    /// `width`×`height`. Does not touch the surface/swapchain.
+    fn new(device: &wgpu::Device, width: u32, height: u32, l: &TargetLayouts) -> Self {
+        let width = width.max(1);
+        let height = height.max(1);
+
+        let (depth_texture, depth_view) = create_depth_texture(device, width, height, 4);
+        let (msaa_texture, msaa_color_view) = create_msaa_color_texture(device, width, height);
+        let (scene_color_tex, scene_color_view) = create_rgba16float_texture(
+            device, width, height, 1,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            "SceneColor",
+        );
+        let (depth_single_tex, depth_single_view) = create_depth_single_texture(device, width, height);
+        let (ssao_tex, ssao_view) = create_r8unorm_texture(device, width, height);
+        let (ssao_blur_tex, ssao_blur_view) = create_r8unorm_texture(device, width, height);
+
+        // Bloom is half-res.
+        let bloom_half_w = (width / 2).max(1);
+        let bloom_half_h = (height / 2).max(1);
+        let (bloom_a_tex, bloom_a_view) = create_bloom_texture(device, bloom_half_w, bloom_half_h, "BloomA");
+        let (bloom_b_tex, bloom_b_view) = create_bloom_texture(device, bloom_half_w, bloom_half_h, "BloomB");
+
+        let depth_resolve_bg = create_depth_resolve_bg(device, l.depth_resolve, &depth_view);
+        let ssao_bg = create_ssao_bg(device, l.ssao, &depth_single_view, l.sampler);
+        let ssao_blur_bg = create_ssao_blur_bg(
+            device, l.ssao_blur, &ssao_view, &depth_single_view, l.sampler,
+        );
+        let bloom_down_bg = create_bloom_down_bg(device, l.bloom_down, &scene_color_view, l.sampler);
+        let bloom_blur_h_bg = create_bloom_blur_bg(device, l.bloom_blur, &bloom_a_view, l.sampler, "BloomBlurH_BG");
+        let bloom_blur_v_bg = create_bloom_blur_bg(device, l.bloom_blur, &bloom_b_view, l.sampler, "BloomBlurV_BG");
+        let post_bg = create_post_bg(
+            device, l.post,
+            &scene_color_view, &ssao_blur_view, &depth_single_view, l.sampler,
+            &bloom_a_view,
+        );
+
+        Self {
+            depth_texture,
+            depth_view,
+            msaa_texture,
+            msaa_color_view,
+            scene_color_tex,
+            scene_color_view,
+            depth_single_tex,
+            depth_single_view,
+            ssao_tex,
+            ssao_view,
+            ssao_blur_tex,
+            ssao_blur_view,
+            bloom_a_tex,
+            bloom_a_view,
+            bloom_b_tex,
+            bloom_b_view,
+            depth_resolve_bg,
+            ssao_bg,
+            ssao_blur_bg,
+            bloom_down_bg,
+            bloom_blur_h_bg,
+            bloom_blur_v_bg,
+            post_bg,
+        }
+    }
+}
+
 pub struct RenderState {
     pub surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
@@ -123,49 +250,21 @@ pub struct RenderState {
     surface_ib: Option<wgpu::Buffer>,
     surface_index_count: u32,
 
-    // ── MSAA depth (multisampled) ─────────────────────────────────────────────
-    pub depth_texture: wgpu::Texture,
-    pub depth_view: wgpu::TextureView,
-
-    // ── MSAA × 4 color ───────────────────────────────────────────────────────
-    msaa_texture: wgpu::Texture,
-    msaa_color_view: wgpu::TextureView,
-
-    // ── Opaque scene resolve target (Rgba16Float, sample_count=1) ─────────────
-    scene_color_tex: wgpu::Texture,
-    scene_color_view: wgpu::TextureView,
-
-    // ── Single-sample depth for post-process sampling ─────────────────────────
-    depth_single_tex: wgpu::Texture,
-    depth_single_view: wgpu::TextureView,
-
-    // ── SSAO texture ──────────────────────────────────────────────────────────
-    ssao_tex: wgpu::Texture,
-    ssao_view: wgpu::TextureView,
+    // ── Offscreen render targets + their bind groups (rebuilt on resize; a
+    //    temporary hi-res instance is built for offline export) ────────────────
+    targets: RenderTargets,
 
     // ── Post-process pipelines ────────────────────────────────────────────────
     depth_resolve_pipeline: wgpu::RenderPipeline,
     ssao_pipeline: wgpu::RenderPipeline,
     post_pipeline: wgpu::RenderPipeline,
-
-    // ── Depth resolve bind group ──────────────────────────────────────────────
-    depth_resolve_bgl: wgpu::BindGroupLayout,
-    depth_resolve_bg: wgpu::BindGroup,
-
-    // ── SSAO bind group ───────────────────────────────────────────────────────
-    ssao_bgl: wgpu::BindGroupLayout,
-    ssao_bg: wgpu::BindGroup,
-
-    // ── SSAO blur (depth-aware 5×5 bilateral) ────────────────────────────────
-    ssao_blur_tex: wgpu::Texture,
-    ssao_blur_view: wgpu::TextureView,
     ssao_blur_pipeline: wgpu::RenderPipeline,
-    ssao_blur_bgl: wgpu::BindGroupLayout,
-    ssao_blur_bg: wgpu::BindGroup,
 
-    // ── Post bind group ───────────────────────────────────────────────────────
+    // ── Bind group layouts (the bind groups themselves live in `targets`) ─────
+    depth_resolve_bgl: wgpu::BindGroupLayout,
+    ssao_bgl: wgpu::BindGroupLayout,
+    ssao_blur_bgl: wgpu::BindGroupLayout,
     post_bgl: wgpu::BindGroupLayout,
-    post_bg: wgpu::BindGroup,
 
     // ── Shared sampler ────────────────────────────────────────────────────────
     linear_sampler: wgpu::Sampler,
@@ -243,25 +342,23 @@ pub struct RenderState {
     scene_center: glam::Vec3,
     scene_radius: f32,
 
-    // ── Bloom ────────────────────────────────────────────────────────────────
+    // ── Bloom (bind groups + half-res textures live in `targets`) ────────────
     bloom_down_pipeline: wgpu::RenderPipeline,
     bloom_blur_h_pipeline: wgpu::RenderPipeline,
     bloom_blur_v_pipeline: wgpu::RenderPipeline,
     bloom_down_bgl: wgpu::BindGroupLayout,
-    bloom_down_bg: wgpu::BindGroup,
     bloom_blur_bgl: wgpu::BindGroupLayout,
-    bloom_blur_h_bg: wgpu::BindGroup,   // reads bloom_a, writes bloom_b
-    bloom_blur_v_bg: wgpu::BindGroup,   // reads bloom_b, writes bloom_a
-    bloom_a_tex: wgpu::Texture,
-    bloom_a_view: wgpu::TextureView,
-    bloom_b_tex: wgpu::Texture,
-    bloom_b_view: wgpu::TextureView,
 
     /// egui overlay renderer.
     pub egui_renderer: egui_wgpu::Renderer,
 
     /// When set, the next render will capture the post-composite output to this path.
     pub pending_screenshot: Option<std::path::PathBuf>,
+
+    /// Supersampling factor for offline `render` export (1..=4). CPU-side only
+    /// (not a shader uniform): the scene is rendered at `antialias`× resolution
+    /// and box-downsampled. Default 2. Set via `set antialias, <1-4>`.
+    pub antialias: u32,
 }
 
 impl RenderState {
@@ -315,20 +412,8 @@ impl RenderState {
         };
         surface.configure(&device, &config);
 
-        // MSAA depth (multisampled) — also has TEXTURE_BINDING for depth resolve
-        let (depth_texture, depth_view) = create_depth_texture(&device, &config, 4);
-        // MSAA color (Rgba16Float × 4) — resolve target is scene_color_tex
-        let (msaa_texture, msaa_color_view) = create_msaa_color_texture(&device, &config);
-        // Single-sample opaque scene resolve target
-        let (scene_color_tex, scene_color_view) = create_rgba16float_texture(
-            &device, &config, 1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            "SceneColor",
-        );
-        // Single-sample depth for SSAO / post
-        let (depth_single_tex, depth_single_view) = create_depth_single_texture(&device, &config);
-        // SSAO texture
-        let (ssao_tex, ssao_view) = create_r8unorm_texture(&device, &config);
+        // Offscreen render targets are allocated below, once the bind group
+        // layouts and shared sampler they depend on exist (see `targets`).
 
         // ── Shared sampler ───────────────────────────────────────────────────
         let linear_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -883,8 +968,6 @@ impl RenderState {
             cache: None,
         });
 
-        let depth_resolve_bg = create_depth_resolve_bg(&device, &depth_resolve_bgl, &depth_view);
-
         // ── SSAO pipeline ─────────────────────────────────────────────────────
         let ssao_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("SSAOBGL"),
@@ -945,10 +1028,7 @@ impl RenderState {
             cache: None,
         });
 
-        let ssao_bg = create_ssao_bg(&device, &ssao_bgl, &depth_single_view, &linear_sampler);
-
         // ── SSAO blur pipeline ────────────────────────────────────────────────
-        let (ssao_blur_tex, ssao_blur_view) = create_r8unorm_texture(&device, &config);
         let ssao_blur_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("SSAOBlurBGL"),
             entries: &[
@@ -1017,16 +1097,7 @@ impl RenderState {
             multiview: None,
             cache: None,
         });
-        let ssao_blur_bg = create_ssao_blur_bg(
-            &device, &ssao_blur_bgl, &ssao_view, &depth_single_view, &linear_sampler,
-        );
-
         // ── Bloom pipelines ─────────────────────────────────────────────────
-        let bloom_half_w = (config.width / 2).max(1);
-        let bloom_half_h = (config.height / 2).max(1);
-        let (bloom_a_tex, bloom_a_view) = create_bloom_texture(&device, bloom_half_w, bloom_half_h, "BloomA");
-        let (bloom_b_tex, bloom_b_view) = create_bloom_texture(&device, bloom_half_w, bloom_half_h, "BloomB");
-
         // Bloom downsample BGL: reads scene_color (full-res), writes bright to half-res
         let bloom_down_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("BloomDownBGL"),
@@ -1049,8 +1120,6 @@ impl RenderState {
                 },
             ],
         });
-        let bloom_down_bg = create_bloom_down_bg(&device, &bloom_down_bgl, &scene_color_view, &linear_sampler);
-
         let bloom_down_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("BloomDownLayout"),
             bind_group_layouts: &[&uniform_bind_group_layout, &bloom_down_bgl],
@@ -1111,8 +1180,6 @@ impl RenderState {
                 },
             ],
         });
-        let bloom_blur_h_bg = create_bloom_blur_bg(&device, &bloom_blur_bgl, &bloom_a_view, &linear_sampler, "BloomBlurH_BG");
-        let bloom_blur_v_bg = create_bloom_blur_bg(&device, &bloom_blur_bgl, &bloom_b_view, &linear_sampler, "BloomBlurV_BG");
 
         let bloom_blur_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("BloomBlurLayout"),
@@ -1275,10 +1342,20 @@ impl RenderState {
             cache: None,
         });
 
-        let post_bg = create_post_bg(
-            &device, &post_bgl,
-            &scene_color_view, &ssao_blur_view, &depth_single_view, &linear_sampler,
-            &bloom_a_view,
+        // ── Offscreen render targets (all layouts + sampler now exist) ────────
+        let targets = RenderTargets::new(
+            &device,
+            config.width,
+            config.height,
+            &TargetLayouts {
+                depth_resolve: &depth_resolve_bgl,
+                ssao: &ssao_bgl,
+                ssao_blur: &ssao_blur_bgl,
+                bloom_down: &bloom_down_bgl,
+                bloom_blur: &bloom_blur_bgl,
+                post: &post_bgl,
+                sampler: &linear_sampler,
+            },
         );
 
         // ── Phase 5: picker ──────────────────────────────────────────────────
@@ -1318,30 +1395,15 @@ impl RenderState {
             surface_vb: None,
             surface_ib: None,
             surface_index_count: 0,
-            depth_texture,
-            depth_view,
-            msaa_texture,
-            msaa_color_view,
-            scene_color_tex,
-            scene_color_view,
-            depth_single_tex,
-            depth_single_view,
-            ssao_tex,
-            ssao_view,
+            targets,
             depth_resolve_pipeline,
             ssao_pipeline,
             post_pipeline,
-            depth_resolve_bgl,
-            depth_resolve_bg,
-            ssao_bgl,
-            ssao_bg,
-            ssao_blur_tex,
-            ssao_blur_view,
             ssao_blur_pipeline,
+            depth_resolve_bgl,
+            ssao_bgl,
             ssao_blur_bgl,
-            ssao_blur_bg,
             post_bgl,
-            post_bg,
             linear_sampler,
             picker,
             sphere_instance_map: Vec::new(),
@@ -1385,16 +1447,10 @@ impl RenderState {
             bloom_blur_h_pipeline,
             bloom_blur_v_pipeline,
             bloom_down_bgl,
-            bloom_down_bg,
             bloom_blur_bgl,
-            bloom_blur_h_bg,
-            bloom_blur_v_bg,
-            bloom_a_tex,
-            bloom_a_view,
-            bloom_b_tex,
-            bloom_b_view,
             egui_renderer,
             pending_screenshot: None,
+            antialias: 2,
         })
     }
 
@@ -1406,62 +1462,26 @@ impl RenderState {
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
 
-        let (dt, dv) = create_depth_texture(&self.device, &self.config, 4);
-        self.depth_texture = dt;
-        self.depth_view = dv;
-
-        let (mt, mv) = create_msaa_color_texture(&self.device, &self.config);
-        self.msaa_texture = mt;
-        self.msaa_color_view = mv;
-
-        let (sct, scv) = create_rgba16float_texture(
-            &self.device, &self.config, 1,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            "SceneColor",
-        );
-        self.scene_color_tex = sct;
-        self.scene_color_view = scv;
-
-        let (dst, dsv) = create_depth_single_texture(&self.device, &self.config);
-        self.depth_single_tex = dst;
-        self.depth_single_view = dsv;
-
-        let (st, sv) = create_r8unorm_texture(&self.device, &self.config);
-        self.ssao_tex = st;
-        self.ssao_view = sv;
-
-        let (sbt, sbv) = create_r8unorm_texture(&self.device, &self.config);
-        self.ssao_blur_tex = sbt;
-        self.ssao_blur_view = sbv;
-
-        // Recreate bind groups (views have changed)
-        self.depth_resolve_bg = create_depth_resolve_bg(&self.device, &self.depth_resolve_bgl, &self.depth_view);
-        self.ssao_bg = create_ssao_bg(&self.device, &self.ssao_bgl, &self.depth_single_view, &self.linear_sampler);
-        self.ssao_blur_bg = create_ssao_blur_bg(
-            &self.device, &self.ssao_blur_bgl,
-            &self.ssao_view, &self.depth_single_view, &self.linear_sampler,
-        );
-
-        // Bloom textures
-        let bloom_half_w = (width / 2).max(1);
-        let bloom_half_h = (height / 2).max(1);
-        let (bat, bav) = create_bloom_texture(&self.device, bloom_half_w, bloom_half_h, "BloomA");
-        self.bloom_a_tex = bat;
-        self.bloom_a_view = bav;
-        let (bbt, bbv) = create_bloom_texture(&self.device, bloom_half_w, bloom_half_h, "BloomB");
-        self.bloom_b_tex = bbt;
-        self.bloom_b_view = bbv;
-        self.bloom_down_bg = create_bloom_down_bg(&self.device, &self.bloom_down_bgl, &self.scene_color_view, &self.linear_sampler);
-        self.bloom_blur_h_bg = create_bloom_blur_bg(&self.device, &self.bloom_blur_bgl, &self.bloom_a_view, &self.linear_sampler, "BloomBlurH_BG");
-        self.bloom_blur_v_bg = create_bloom_blur_bg(&self.device, &self.bloom_blur_bgl, &self.bloom_b_view, &self.linear_sampler, "BloomBlurV_BG");
-
-        self.post_bg = create_post_bg(
-            &self.device, &self.post_bgl,
-            &self.scene_color_view, &self.ssao_blur_view, &self.depth_single_view, &self.linear_sampler,
-            &self.bloom_a_view,
-        );
+        // Rebuild the whole offscreen target set at the new resolution. The
+        // bind group layouts and shared sampler are unchanged, so only the
+        // textures/views and their bind groups are recreated here.
+        self.targets = RenderTargets::new(&self.device, width, height, &self.target_layouts());
 
         self.picker.resize(&self.device, width, height);
+    }
+
+    /// Borrow the bind-group layouts and sampler needed to build a
+    /// [`RenderTargets`]. They live on `self` and never change with resolution.
+    fn target_layouts(&self) -> TargetLayouts<'_> {
+        TargetLayouts {
+            depth_resolve: &self.depth_resolve_bgl,
+            ssao: &self.ssao_bgl,
+            ssao_blur: &self.ssao_blur_bgl,
+            bloom_down: &self.bloom_down_bgl,
+            bloom_blur: &self.bloom_blur_bgl,
+            post: &self.post_bgl,
+            sampler: &self.linear_sampler,
+        }
     }
 
     /// Rebuild GPU geometry buffers from scene data.
@@ -1953,6 +1973,16 @@ impl RenderState {
     }
 
     pub fn update_uniforms(&self, camera: &Camera) {
+        let screen_size = [self.config.width as f32, self.config.height as f32];
+        self.write_uniforms(camera, screen_size);
+    }
+
+    /// Write the per-frame uniform buffer using an explicit `screen_size`. The
+    /// live path passes the swapchain size; offline export passes the (super-
+    /// sampled) capture size so screen-space effects sample at the right scale.
+    /// The projection aspect comes from `camera` (callers override its viewport
+    /// for non-square exports).
+    fn write_uniforms(&self, camera: &Camera, screen_size: [f32; 2]) {
         let view  = camera.view_matrix();
         let proj  = camera.projection_matrix();
         let inv_proj = proj.inverse();
@@ -1976,7 +2006,6 @@ impl RenderState {
         );
         let light2_dir = camera.rotation * light2_base;
 
-        let screen_size = [self.config.width as f32, self.config.height as f32];
         let bg = [
             self.bg_color.r as f32,
             self.bg_color.g as f32,
@@ -2098,32 +2127,22 @@ impl RenderState {
     }
 
     /// Render the 3-D scene and then the egui overlay in one submission.
-    pub fn render(
-        &mut self,
-        egui_primitives: &[egui::ClippedPrimitive],
-        screen_desc: &egui_wgpu::ScreenDescriptor,
-        textures_delta: egui::TexturesDelta,
-    ) -> anyhow::Result<()> {
-        let output = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => return Ok(()),
-            Err(e) => return Err(e.into()),
-        };
-        // Final sRGB surface texture — post composite and egui render here.
-        let output_view = output.texture.create_view(&Default::default());
-
-        // Upload any new egui textures.
-        for (id, delta) in &textures_delta.set {
-            self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
-        }
-
-        let mut encoder = self.device.create_command_encoder(&Default::default());
-
-        // Upload egui vertex/index buffers into the encoder.
-        self.egui_renderer.update_buffers(
-            &self.device, &self.queue, &mut encoder, egui_primitives, screen_desc,
-        );
-
+    /// Record the full scene render (shadow map + opaque + overlays + surface +
+    /// SSAO + bloom + post-composite) into `encoder`, drawing offscreen work
+    /// into `targets` and writing the final tone-mapped result into `final_view`.
+    ///
+    /// This is the single source of truth for the scene passes, shared by the
+    /// live [`render`](Self::render) path (targets = `self.targets`, final view =
+    /// the swapchain) and the offline [`export`](Self::export) path (a temporary
+    /// hi-res `targets` and capture texture). It does NOT write the uniform
+    /// buffer (callers set `screen_size` first), touch the swapchain, draw egui,
+    /// or present. The shadow map is the shared fixed-size `self.shadow_map_view`.
+    fn record_scene(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        targets: &RenderTargets,
+        final_view: &wgpu::TextureView,
+    ) {
         // ── Pass 0: Shadow map ──────────────────────────────────────────────
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2215,8 +2234,8 @@ impl RenderState {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("OpaquePass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.msaa_color_view,
-                    resolve_target: Some(&self.scene_color_view),
+                    view: &targets.msaa_color_view,
+                    resolve_target: Some(&targets.scene_color_view),
                     ops: wgpu::Operations {
                         // Alpha=0 so post.wgsl can detect background pixels (no geometry)
                         // by checking scene_tex.a == 0.  RGB = bg_color so surface
@@ -2231,7 +2250,7 @@ impl RenderState {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
+                    view: &targets.depth_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -2278,7 +2297,7 @@ impl RenderState {
                 label: Some("DepthResolvePass"),
                 color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_single_view,
+                    view: &targets.depth_single_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Clear(1.0),
                         store: wgpu::StoreOp::Store,
@@ -2288,7 +2307,7 @@ impl RenderState {
                 ..Default::default()
             });
             pass.set_pipeline(&self.depth_resolve_pipeline);
-            pass.set_bind_group(0, &self.depth_resolve_bg, &[]);
+            pass.set_bind_group(0, &targets.depth_resolve_bg, &[]);
             pass.draw(0..3, 0..1);
         }
 
@@ -2301,7 +2320,7 @@ impl RenderState {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("LigandOverlayPass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.scene_color_view,
+                    view: &targets.scene_color_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
@@ -2309,7 +2328,7 @@ impl RenderState {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_single_view,
+                    view: &targets.depth_single_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
@@ -2346,7 +2365,7 @@ impl RenderState {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("SurfacePass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.scene_color_view,
+                    view: &targets.scene_color_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
@@ -2354,7 +2373,7 @@ impl RenderState {
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_single_view,
+                    view: &targets.depth_single_view,
                     depth_ops: Some(wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         // Store: depth_single_tex is read by SSAO and Post Sobel.
@@ -2380,7 +2399,7 @@ impl RenderState {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("SSAOPass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.ssao_view,
+                    view: &targets.ssao_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
@@ -2392,7 +2411,7 @@ impl RenderState {
             });
             pass.set_pipeline(&self.ssao_pipeline);
             pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            pass.set_bind_group(1, &self.ssao_bg, &[]);
+            pass.set_bind_group(1, &targets.ssao_bg, &[]);
             pass.draw(0..3, 0..1);
         }
 
@@ -2401,7 +2420,7 @@ impl RenderState {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("SSAOBlurPass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.ssao_blur_view,
+                    view: &targets.ssao_blur_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
@@ -2413,7 +2432,7 @@ impl RenderState {
             });
             pass.set_pipeline(&self.ssao_blur_pipeline);
             pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            pass.set_bind_group(1, &self.ssao_blur_bg, &[]);
+            pass.set_bind_group(1, &targets.ssao_blur_bg, &[]);
             pass.draw(0..3, 0..1);
         }
 
@@ -2422,7 +2441,7 @@ impl RenderState {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("BloomDown"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.bloom_a_view,
+                    view: &targets.bloom_a_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -2434,7 +2453,7 @@ impl RenderState {
             });
             pass.set_pipeline(&self.bloom_down_pipeline);
             pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            pass.set_bind_group(1, &self.bloom_down_bg, &[]);
+            pass.set_bind_group(1, &targets.bloom_down_bg, &[]);
             pass.draw(0..3, 0..1);
         }
 
@@ -2443,7 +2462,7 @@ impl RenderState {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("BloomBlurH"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.bloom_b_view,
+                    view: &targets.bloom_b_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -2454,7 +2473,7 @@ impl RenderState {
                 ..Default::default()
             });
             pass.set_pipeline(&self.bloom_blur_h_pipeline);
-            pass.set_bind_group(0, &self.bloom_blur_h_bg, &[]);
+            pass.set_bind_group(0, &targets.bloom_blur_h_bg, &[]);
             pass.draw(0..3, 0..1);
         }
 
@@ -2463,7 +2482,7 @@ impl RenderState {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("BloomBlurV"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.bloom_a_view,
+                    view: &targets.bloom_a_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -2474,17 +2493,17 @@ impl RenderState {
                 ..Default::default()
             });
             pass.set_pipeline(&self.bloom_blur_v_pipeline);
-            pass.set_bind_group(0, &self.bloom_blur_v_bg, &[]);
+            pass.set_bind_group(0, &targets.bloom_blur_v_bg, &[]);
             pass.draw(0..3, 0..1);
         }
 
         // ── Pass 5: Post composite pass ───────────────────────────────────────
-        // SSAO + Sobel edge + Bloom + ACES → output_view (sRGB)
+        // SSAO + Sobel edge + Bloom + ACES → final_view (sRGB)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("PostPass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &output_view,
+                    view: final_view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -2496,9 +2515,40 @@ impl RenderState {
             });
             pass.set_pipeline(&self.post_pipeline);
             pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            pass.set_bind_group(1, &self.post_bg, &[]);
+            pass.set_bind_group(1, &targets.post_bg, &[]);
             pass.draw(0..3, 0..1);
         }
+    }
+
+    pub fn render(
+        &mut self,
+        egui_primitives: &[egui::ClippedPrimitive],
+        screen_desc: &egui_wgpu::ScreenDescriptor,
+        textures_delta: egui::TexturesDelta,
+    ) -> anyhow::Result<()> {
+        let output = match self.surface.get_current_texture() {
+            Ok(t) => t,
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        };
+        // Final sRGB surface texture — post composite and egui render here.
+        let output_view = output.texture.create_view(&Default::default());
+
+        // Upload any new egui textures.
+        for (id, delta) in &textures_delta.set {
+            self.egui_renderer.update_texture(&self.device, &self.queue, *id, delta);
+        }
+
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+
+        // Upload egui vertex/index buffers into the encoder.
+        self.egui_renderer.update_buffers(
+            &self.device, &self.queue, &mut encoder, egui_primitives, screen_desc,
+        );
+
+        // ── Scene passes 0-5 → offscreen targets, composite into the
+        //    swapchain view. Shared with the offline export path.
+        self.record_scene(&mut encoder, &self.targets, &output_view);
 
         // ── Screenshot capture (between post-composite and egui) ─────────────
         // Re-run the post-composite pass to a separate COPY_SRC texture so we
@@ -2533,7 +2583,7 @@ impl RenderState {
                 });
                 pass.set_pipeline(&self.post_pipeline);
                 pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                pass.set_bind_group(1, &self.post_bg, &[]);
+                pass.set_bind_group(1, &self.targets.post_bg, &[]);
                 pass.draw(0..3, 0..1);
             }
 
@@ -2654,6 +2704,195 @@ impl RenderState {
 
         Ok(())
     }
+
+    /// Offline high-resolution export. Renders the current scene to `out_w`×`out_h`
+    /// at `self.antialias`× supersampling and saves it as a PNG, entirely
+    /// independent of the swapchain (the on-screen surface is never touched).
+    ///
+    /// Pipeline: build temporary hi-res [`RenderTargets`] + a capture texture,
+    /// record the scene into them via [`record_scene`](Self::record_scene), read
+    /// the capture back with the standard 256-byte row alignment, box-downsample
+    /// `ss`×`ss` in **linear** space (the capture format is sRGB), and write RGBA.
+    /// The live uniforms are restored before returning so the next on-screen
+    /// frame is correct. Non-square exports use projection aspect `out_w/out_h`.
+    pub fn export(
+        &mut self,
+        camera: &mut Camera,
+        out_w: u32,
+        out_h: u32,
+        path: &std::path::Path,
+    ) -> anyhow::Result<()> {
+        let out_w = out_w.max(1);
+        let out_h = out_h.max(1);
+
+        // Memory cap on the supersampled render resolution: reduce ss until the
+        // pixel count is under the cap (matching the grid-size safety approach).
+        const MAX_PIXELS: u64 = 64_000_000;
+        let mut ss = self.antialias.clamp(1, 4);
+        while ss > 1
+            && (out_w as u64 * ss as u64) * (out_h as u64 * ss as u64) > MAX_PIXELS
+        {
+            ss -= 1;
+            log::warn!(
+                "export: supersample factor reduced to {ss}× to keep {out_w}×{out_h} render under the {MAX_PIXELS}-pixel cap"
+            );
+        }
+        let rw = out_w * ss;
+        let rh = out_h * ss;
+        if (rw as u64) * (rh as u64) > MAX_PIXELS {
+            log::warn!(
+                "export: {rw}×{rh} still exceeds the {MAX_PIXELS}-pixel cap at 1× supersampling; proceeding anyway"
+            );
+        }
+
+        // Temporary hi-res offscreen targets + capture texture (surface untouched).
+        let targets = RenderTargets::new(&self.device, rw, rh, &self.target_layouts());
+        let capture_tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ExportCapture"),
+            size: wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let capture_view = capture_tex.create_view(&Default::default());
+
+        // Write uniforms at the supersampled resolution, with projection aspect
+        // set to out_w/out_h (the ratio is preserved by the ×ss factor).
+        let saved_viewport = camera.viewport;
+        camera.viewport = glam::Vec2::new(out_w as f32, out_h as f32);
+        self.write_uniforms(camera, [rw as f32, rh as f32]);
+        camera.viewport = saved_viewport;
+
+        // Record the full scene (shadow → post) into the hi-res capture texture.
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        self.record_scene(&mut encoder, &targets, &capture_view);
+
+        // Copy capture → staging buffer with 256-byte row alignment.
+        let bytes_per_pixel = 4u32;
+        let unpadded_bytes_per_row = rw * bytes_per_pixel;
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let padded_bytes_per_row = unpadded_bytes_per_row.div_ceil(align) * align;
+        let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ExportStaging"),
+            size: (padded_bytes_per_row * rh) as u64,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &capture_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging_buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: None,
+                },
+            },
+            wgpu::Extent3d { width: rw, height: rh, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([encoder.finish()]);
+
+        // Restore live uniforms so the next on-screen frame renders correctly.
+        self.update_uniforms(camera);
+
+        // Read the capture back.
+        let slice = staging_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("export: buffer map channel closed"))?
+            .map_err(|e| anyhow::anyhow!("export: buffer map failed: {e}"))?;
+        let data = slice.get_mapped_range();
+
+        // Swapchain format is BGRA-ordered on Metal, RGBA on many Vulkan adapters.
+        let swap_rb = matches!(
+            self.config.format,
+            wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm
+        );
+
+        // Unpad rows into a tightly-packed rw×rh RGBA buffer (still sRGB 8-bit).
+        let mut hires = vec![0u8; (rw as usize) * (rh as usize) * 4];
+        for row in 0..rh {
+            let src = (row * padded_bytes_per_row) as usize;
+            let dst = (row * rw * 4) as usize;
+            let row_data = &data[src..src + unpadded_bytes_per_row as usize];
+            for (i, pixel) in row_data.chunks_exact(4).enumerate() {
+                let o = dst + i * 4;
+                if swap_rb {
+                    hires[o] = pixel[2];
+                    hires[o + 1] = pixel[1];
+                    hires[o + 2] = pixel[0];
+                    hires[o + 3] = pixel[3];
+                } else {
+                    hires[o..o + 4].copy_from_slice(pixel);
+                }
+            }
+        }
+        drop(data);
+        staging_buf.unmap();
+
+        // Box-average ss×ss blocks in linear space, then re-encode to sRGB.
+        let out = if ss == 1 {
+            hires
+        } else {
+            downsample_srgb(&hires, rw, out_w, out_h, ss)
+        };
+
+        let img = image::RgbaImage::from_raw(out_w, out_h, out)
+            .ok_or_else(|| anyhow::anyhow!("export: failed to build image buffer"))?;
+        img.save(path)?;
+        println!("Rendered: {} ({}×{}, {}× supersampled)", path.display(), out_w, out_h, ss);
+        Ok(())
+    }
+}
+
+// ── sRGB downsampling helpers ───────────────────────────────────────────────────
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 { c * 12.92 } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+}
+
+/// Box-downsample an `rw`-wide RGBA8 (sRGB-encoded) buffer by `ss`×`ss` into an
+/// `out_w`×`out_h` buffer. RGB is averaged in linear light (correct for sRGB
+/// textures); alpha is averaged directly.
+fn downsample_srgb(src: &[u8], rw: u32, out_w: u32, out_h: u32, ss: u32) -> Vec<u8> {
+    let mut out = vec![0u8; (out_w as usize) * (out_h as usize) * 4];
+    let n = (ss * ss) as f32;
+    for oy in 0..out_h {
+        for ox in 0..out_w {
+            let (mut r, mut g, mut b, mut a) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for dy in 0..ss {
+                for dx in 0..ss {
+                    let sx = ox * ss + dx;
+                    let sy = oy * ss + dy;
+                    let i = ((sy * rw + sx) * 4) as usize;
+                    r += srgb_to_linear(src[i] as f32 / 255.0);
+                    g += srgb_to_linear(src[i + 1] as f32 / 255.0);
+                    b += srgb_to_linear(src[i + 2] as f32 / 255.0);
+                    a += src[i + 3] as f32 / 255.0;
+                }
+            }
+            let o = ((oy * out_w + ox) * 4) as usize;
+            out[o]     = (linear_to_srgb(r / n) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            out[o + 1] = (linear_to_srgb(g / n) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            out[o + 2] = (linear_to_srgb(b / n) * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+            out[o + 3] = (a / n * 255.0 + 0.5).clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
 }
 
 // ── Bind group helpers ────────────────────────────────────────────────────────
@@ -2906,14 +3145,15 @@ fn build_pipeline(
 
 fn create_depth_texture(
     device: &wgpu::Device,
-    config: &wgpu::SurfaceConfiguration,
+    width: u32,
+    height: u32,
     sample_count: u32,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("DepthTexture"),
         size: wgpu::Extent3d {
-            width: config.width,
-            height: config.height,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -2930,13 +3170,14 @@ fn create_depth_texture(
 
 fn create_depth_single_texture(
     device: &wgpu::Device,
-    config: &wgpu::SurfaceConfiguration,
+    width: u32,
+    height: u32,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("DepthSingle"),
         size: wgpu::Extent3d {
-            width: config.width,
-            height: config.height,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -2952,13 +3193,14 @@ fn create_depth_single_texture(
 
 fn create_msaa_color_texture(
     device: &wgpu::Device,
-    config: &wgpu::SurfaceConfiguration,
+    width: u32,
+    height: u32,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("MSAAColor"),
         size: wgpu::Extent3d {
-            width: config.width,
-            height: config.height,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -2974,7 +3216,8 @@ fn create_msaa_color_texture(
 
 fn create_rgba16float_texture(
     device: &wgpu::Device,
-    config: &wgpu::SurfaceConfiguration,
+    width: u32,
+    height: u32,
     sample_count: u32,
     usage: wgpu::TextureUsages,
     label: &str,
@@ -2982,8 +3225,8 @@ fn create_rgba16float_texture(
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
-            width: config.width,
-            height: config.height,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -2999,13 +3242,14 @@ fn create_rgba16float_texture(
 
 fn create_r8unorm_texture(
     device: &wgpu::Device,
-    config: &wgpu::SurfaceConfiguration,
+    width: u32,
+    height: u32,
 ) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("SSAO"),
         size: wgpu::Extent3d {
-            width: config.width,
-            height: config.height,
+            width,
+            height,
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,

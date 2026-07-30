@@ -59,6 +59,11 @@ pub struct App {
     /// about_to_wait AFTER scene re-upload, so the capture reflects -c changes.
     pending_screenshot_path: Option<std::path::PathBuf>,
 
+    /// Deferred high-res `render` export: (path, width, height). Executed in
+    /// about_to_wait AFTER scene re-upload (and before quit) via RenderState::export.
+    /// width/height None → use the current window inner size.
+    pending_render: Option<(std::path::PathBuf, Option<u32>, Option<u32>)>,
+
     /// Active dock trace session (None when not in trace mode).
     dock_trace: Option<DockTrace>,
 }
@@ -87,6 +92,7 @@ impl App {
             egui_winit: None,
             pending_quit: false,
             pending_screenshot_path: None,
+            pending_render: None,
             dock_trace: None,
         }
     }
@@ -471,6 +477,7 @@ impl ApplicationHandler for App {
                             "light2_intensity" => render.light2_intensity     = value.max(0.0),
                             "light2_elevation" => render.light2_elevation_deg = value.clamp(-90.0, 90.0),
                             "light2_azimuth"   => render.light2_azimuth_deg   = value,
+                            "antialias"        => render.antialias = (value.round() as i64).clamp(1, 4) as u32,
                             _ => {}
                         }
                         window.request_redraw();
@@ -539,6 +546,14 @@ impl ApplicationHandler for App {
                     continue;
                 }
 
+                if let Command::Render { path, width, height } = cmd {
+                    self.pending_render = Some((path, width, height));
+                    if let Some(tx) = &self.resp_tx {
+                        let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
+                    }
+                    continue;
+                }
+
                 if let Command::DockTrace { trace_path, ligand_path } = cmd {
                     let resp = self.handle_docktrace_load(&trace_path, &ligand_path);
                     if let Some(tx) = &self.resp_tx {
@@ -579,6 +594,21 @@ impl ApplicationHandler for App {
             if let AppState::Running { render, window, .. } = &mut self.state {
                 render.pending_screenshot = Some(path);
                 window.request_redraw();
+            }
+        }
+
+        // Execute deferred high-res render AFTER scene re-upload. This runs
+        // synchronously (export blocks on the readback), so it completes before
+        // any pending quit is honored below.
+        if let Some((path, w, h)) = self.pending_render.take() {
+            if let AppState::Running { render, camera, window } = &mut self.state {
+                let win = window.inner_size();
+                // No dims → window size; only width → square; both → as given.
+                let out_w = w.unwrap_or(win.width.max(1));
+                let out_h = h.or(w).unwrap_or(win.height.max(1));
+                if let Err(e) = render.export(camera, out_w, out_h, &path) {
+                    eprintln!("render: {e}");
+                }
             }
         }
 
@@ -744,6 +774,7 @@ impl App {
                             "light2_intensity" => render.light2_intensity     = value.max(0.0),
                             "light2_elevation" => render.light2_elevation_deg = value.clamp(-90.0, 90.0),
                             "light2_azimuth"   => render.light2_azimuth_deg   = value,
+                            "antialias"        => render.antialias = (value.round() as i64).clamp(1, 4) as u32,
                             _ => {}
                         }
                     }
@@ -759,6 +790,10 @@ impl App {
                 }
                 if let Command::Png { path } = cmd {
                     self.pending_screenshot_path = Some(path);
+                    return;
+                }
+                if let Command::Render { path, width, height } = cmd {
+                    self.pending_render = Some((path, width, height));
                     return;
                 }
                 let AppState::Running { camera, .. } = &mut self.state else { return };
@@ -1363,6 +1398,7 @@ fn format_get_params(render: &RenderState, name: Option<&str>) -> String {
         ("light2_intensity", format!("{:.2}", render.light2_intensity)),
         ("light2_elevation", format!("{:.1}", render.light2_elevation_deg)),
         ("light2_azimuth",   format!("{:.1}", render.light2_azimuth_deg)),
+        ("antialias",        format!("{}", render.antialias)),
     ];
 
     match name {

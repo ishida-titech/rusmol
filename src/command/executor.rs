@@ -291,6 +291,7 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
         Command::SetColor { .. } => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
         Command::Get { .. }   => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
         Command::Png { .. } => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
+        Command::Render { .. } => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
         Command::DockTrace { .. } => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
         Command::DockTraceNav(_) => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
         Command::Help => (CommandResponse::Ok(help_text()), SceneDirty::NONE),
@@ -376,6 +377,7 @@ fn help_text() -> String {
    set surface_type, <type>     Surface method (gaussian / ses)
    set surface_quality, <0.2-2> Grid resolution in Å (smaller=finer, default=0.5)
    set surface_smooth, <0-100>  Surface smoothing iterations (higher=smoother, default=6)
+   set antialias, <1-4>         Supersampling factor for `render` export (default=2)
    set surface_color, <color> [, obj]   Fix the surface color
    set cartoon_color, <color> [, obj]   Fix the ribbon color
    set surface_color, default [, obj]   Restore the original atom colors
@@ -389,7 +391,9 @@ fn help_text() -> String {
    get <name>                    Show the value of one parameter
 
  Image export
-   png <filename>                Save a screenshot as PNG
+   png <filename>                Save a screenshot as PNG (window resolution)
+   render <file> [, W [, H]]     High-res offline render (default: window size,
+                                 supersampled by `set antialias`)
 
  Docking trace
    docktrace <trace>, <ligand>   Load a trace file and enter interactive mode

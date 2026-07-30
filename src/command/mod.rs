@@ -59,6 +59,9 @@ pub enum Command {
     Get { name: Option<String> },
     /// Save a screenshot as PNG: `png <filename>`
     Png { path: PathBuf },
+    /// High-resolution offline render to PNG: `render <file> [, W [, H]]`.
+    /// W/H default to the current window size; supersampling from `set antialias`.
+    Render { path: PathBuf, width: Option<u32>, height: Option<u32> },
     /// Load dock trace: `docktrace <trace_file>, <ligand_pdbqt>`
     DockTrace { trace_path: PathBuf, ligand_path: PathBuf },
     /// Navigate within dock trace mode

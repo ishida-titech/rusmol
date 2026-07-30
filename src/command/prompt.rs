@@ -35,7 +35,7 @@ impl Validator for RusmolHelper {}
 const COMMANDS: &[&str] = &[
     "load", "select", "show", "hide", "color", "enable", "disable", "delete",
     "zoom", "reset", "bg", "light", "light2", "set", "get", "docktrace",
-    "help", "quit",
+    "png", "render", "help", "quit",
 ];
 
 /// Representation names for show/hide.
@@ -56,6 +56,7 @@ const SETTINGS: &[&str] = &[
     "transparency", "surface_type", "surface_quality", "surface_smooth", "surface_color",
     "cartoon_color", "edge_strength", "roughness", "metallic",
     "ibl_intensity", "shadow_strength", "bloom_threshold", "bloom_intensity",
+    "antialias",
     "light_intensity", "light_elevation", "light_azimuth",
     "light2_intensity", "light2_elevation", "light2_azimuth",
 ];
