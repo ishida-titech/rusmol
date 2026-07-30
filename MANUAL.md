@@ -276,6 +276,41 @@ set surface_quality, 0.3
 set roughness, 0.6
 ```
 
+### png / screenshot
+
+Save a screenshot of the current scene at the **window resolution** (fast; the
+egui toolbar is excluded).
+
+```
+png figure.png
+```
+
+### render
+
+Render a **high-quality, high-resolution figure** offscreen and save it as a
+PNG, independent of the window size. The scene is drawn at
+`antialias`× supersampled resolution and downsampled for strong anti-aliasing
+of surfaces, ribbons, and bonds; the export also uses a higher-resolution
+shadow map and more ambient-occlusion samples than the live view.
+
+```
+render figure.png              # uses the current window size
+render figure.png, 2400        # 2400 × 2400
+render figure.png, 3000, 2000  # 3000 × 2000 (aspect preserved, not stretched)
+```
+
+Combine with the export settings below for publication figures:
+
+```
+set antialias, 3               # 3× supersampling (crisper edges)
+set transparent_bg, 1          # background alpha = 0 (for compositing)
+set dof, 0.6                   # depth-of-field focal blur
+render figure.png, 3000, 3000
+```
+
+A memory cap automatically lowers the supersample factor for very large
+outputs.
+
 ### help / h / ?
 
 Print the command reference.
@@ -427,6 +462,19 @@ set <name>, <value>
 | `shadow_strength` | `shadow` | 0.0 - 1.0 | 0.4 | Shadow darkness (0=no shadow) |
 | `bloom_threshold` | | >= 0.0 | 1.0 | Bloom luminance threshold |
 | `bloom_intensity` | `bloom` | >= 0.0 | 0.0 | Bloom glow intensity (0=off) |
+| `ssao_samples` | | 8 - 64 | 16 | Ambient-occlusion sample count (`render` uses ≥32) |
+
+### High-Quality Export (`render`)
+
+These affect the `render` command (offline figures); see also [render](#render).
+
+| Setting | Range | Default | Description |
+|---------|-------|---------|-------------|
+| `antialias` | 1 - 4 | 2 | Supersampling factor for `render` (higher = smoother, slower) |
+| `transparent_bg` | 0 / 1 | 0 | Transparent (alpha) background in the exported PNG |
+| `dof` | 0.0 - 1.0 | 0.0 | Depth-of-field strength (0 = off) |
+| `dof_aperture` | >= 0.0 | 1.0 | Depth-of-field blur scale |
+| `dof_focus` | >= 0.0 (A) | 0 | Focus distance; 0 = auto (camera-to-center) |
 
 ### Surface Parameters
 

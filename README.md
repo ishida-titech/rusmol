@@ -30,7 +30,10 @@ sub-second cold start, built on [wgpu](https://wgpu.rs/).
   sticks + ligand–protein H-bonds), and Pocket Surface.
 - **Docking trace playback** — step through an AutoDock-style optimization
   trajectory (`docktrace`).
-- **PNG export** — `png <file>` for scriptable, headless-style screenshots.
+- **PNG export** — `png <file>` for a quick window-resolution screenshot, or
+  `render <file> [, W [, H]]` for high-resolution, supersampled
+  **publication figures** with optional transparent background and depth of
+  field.
 - **File formats** — PDB and PDBQT.
 
 <p align="center">
@@ -115,6 +118,10 @@ rusmol tests/dock_trace/receptor.pdbqt tests/dock_trace/ligand.pdbqt \
 # Fully scripted, headless-style: render to PNG and quit
 rusmol tests/fixtures/2je5.pdb \
   -c "show surface; color chain; bg white; png out.png; quit"
+
+# High-resolution publication figure (3x supersampled, 2400x2400)
+rusmol tests/fixtures/2je5.pdb \
+  -c "show surface; color chain; bg white; set antialias,3; render figure.png, 2400; quit"
 ```
 
 RusMol opens a 3D window and an interactive prompt in the terminal. Type
