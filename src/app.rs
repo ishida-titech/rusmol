@@ -423,6 +423,7 @@ impl ApplicationHandler for App {
 
                 if let Command::Set { ref name, value } = cmd {
                     let mut need_rebuild = false;
+                    let mut need_atoms = false;
                     if let AppState::Running { render, window, .. } = &mut self.state {
                         match name.as_str() {
                             "transparency" | "surface_transparency" => {
@@ -483,12 +484,16 @@ impl ApplicationHandler for App {
                             "dof"              => render.dof_strength = value.clamp(0.0, 1.0),
                             "dof_aperture"     => render.dof_aperture = value.max(0.0),
                             "dof_focus"        => render.dof_focus = value.max(0.0),
+                            "show_covalent"    => { render.show_covalent = value != 0.0; need_atoms = true; }
                             _ => {}
                         }
                         window.request_redraw();
                     }
                     if need_rebuild {
                         self.scene_dirty |= SceneDirty::SURFACE;
+                    }
+                    if need_atoms {
+                        self.scene_dirty |= SceneDirty::ATOMS;
                     }
                     if let Some(tx) = &self.resp_tx {
                         let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
@@ -725,6 +730,7 @@ impl App {
                 }
                 if let Command::Set { ref name, value } = cmd {
                     let mut need_rebuild = false;
+                    let mut need_atoms = false;
                     if let AppState::Running { render, .. } = &mut self.state {
                         match name.as_str() {
                             "transparency" | "surface_transparency" => {
@@ -785,11 +791,15 @@ impl App {
                             "dof"              => render.dof_strength = value.clamp(0.0, 1.0),
                             "dof_aperture"     => render.dof_aperture = value.max(0.0),
                             "dof_focus"        => render.dof_focus = value.max(0.0),
+                            "show_covalent"    => { render.show_covalent = value != 0.0; need_atoms = true; }
                             _ => {}
                         }
                     }
                     if need_rebuild {
                         self.scene_dirty |= SceneDirty::SURFACE;
+                    }
+                    if need_atoms {
+                        self.scene_dirty |= SceneDirty::ATOMS;
                     }
                     return;
                 }
@@ -1395,6 +1405,7 @@ fn format_get_params(render: &RenderState, name: Option<&str>) -> String {
         ("transparency",    format!("{:.2}", 1.0 - render.surface_alpha)),
         ("surface_type",    surface_type_str.to_string()),
         ("surface_quality", format!("{:.2}", render.surface_quality)),
+        ("show_covalent",   format!("{}", render.show_covalent as u8)),
         ("edge_strength",   format!("{:.2}", render.edge_strength)),
         ("roughness",       format!("{:.2}", render.roughness)),
         ("metallic",        format!("{:.2}", render.metallic)),

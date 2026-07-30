@@ -190,7 +190,7 @@ fn parse_set(rest: &str) -> Result<Command, String> {
         "transparency" | "surface_transparency" | "edge_strength" | "roughness" | "metallic"
         | "ibl_intensity" | "shadow_strength" | "shadow"
         | "bloom_threshold" | "bloom_intensity" | "bloom"
-        | "surface_quality" | "surface_smooth" | "antialias"
+        | "surface_quality" | "surface_smooth" | "antialias" | "show_covalent"
         | "transparent_bg" | "ssao_samples" | "dof" | "dof_aperture" | "dof_focus"
         | "light_intensity" | "light_elevation" | "light_azimuth"
         | "light2_intensity" | "light2_elevation" | "light2_azimuth" => {

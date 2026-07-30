@@ -463,6 +463,7 @@ set <name>, <value>
 | `bloom_threshold` | | >= 0.0 | 1.0 | Bloom luminance threshold |
 | `bloom_intensity` | `bloom` | >= 0.0 | 0.0 | Bloom glow intensity (0=off) |
 | `ssao_samples` | | 8 - 64 | 16 | Ambient-occlusion sample count (`render` uses ≥32) |
+| `show_covalent` | | 0 / 1 | 1 | Auto-highlight covalent protein–ligand bonds in gold and show the linked residue as sticks |
 
 ### High-Quality Export (`render`)
 

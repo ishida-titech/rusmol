@@ -28,6 +28,10 @@ pub enum PickResult {
 const BOND_RADIUS: f32 = 0.18;
 /// Stick representation is slightly chunkier than ball-and-stick bonds.
 const STICK_RADIUS: f32 = BOND_RADIUS * 2.5;
+/// Gold/yellow highlight for auto-detected covalent protein–ligand links.
+const COVALENT_BOND_COLOR: [f32; 3] = [1.0, 0.82, 0.10];
+/// Covalent link bonds are drawn thicker than normal sticks.
+const COVALENT_BOND_RADIUS: f32 = STICK_RADIUS * 1.5;
 const BACKBONE_TUBE_RADIUS: f32 = 0.30;
 const BACKBONE_JOINT_RADIUS: f32 = 0.36;
 const SHADOW_MAP_SIZE: u32 = 2048;
@@ -351,6 +355,10 @@ pub struct RenderState {
     pub surface_smooth: u32,
     /// When true (Pocket Surface preset), keep only the surface facing the ligand.
     pub surface_clip_to_ligand: bool,
+    /// When true (default), auto-detect covalent protein–ligand links (from
+    /// CONECT/topology) and highlight them in gold, showing the partner residue
+    /// as sticks. Toggled via `set show_covalent, 0|1`.
+    pub show_covalent: bool,
     /// Ligand–protein hydrogen bonds (heavy-atom endpoint pairs) drawn as dashed
     /// lines in the Binding Site view. Empty in all other presets.
     pub hbond_segments: Vec<(glam::Vec3, glam::Vec3)>,
@@ -1543,6 +1551,7 @@ impl RenderState {
             surface_quality: 0.35,
             surface_smooth: 6,
             surface_clip_to_ligand: false,
+            show_covalent: true,
             hbond_segments: Vec::new(),
             shadow_map_view,
             shadow_uniform_buffer,
@@ -1638,10 +1647,72 @@ impl RenderState {
                 let atoms  = &obj.structure.atoms;
                 let colors = &obj.atom_colors;
 
+                // ── Covalent protein–ligand links (CONECT/topology) ───────────
+                // A bond where exactly one endpoint is a ligand atom (HETATM,
+                // non-water) and the other is a non-hetatm polymer atom, in a
+                // *different* residue, is a genuine covalent link (not a distance
+                // guess). We highlight the crossing bond in gold and show the
+                // partner protein residue as sticks. `covalent_partner_atoms`
+                // holds every atom index of those partner residues; it is used
+                // to compute a transient *effective* rep (stored flags OR
+                // REP_STICK) without mutating `obj.atom_rep_show`.
+                let is_ligand_atom = |i: usize| -> bool {
+                    let a = &atoms[i];
+                    a.is_hetatm && !matches!(a.residue.name.as_str(), "HOH" | "WAT" | "DOD")
+                };
+                let covalent_partner_atoms: std::collections::HashSet<usize> = if self.show_covalent {
+                    let mask = REP_BALL_STICK | REP_STICK;
+                    let mut keys: std::collections::HashSet<(char, i32, Option<char>)> =
+                        std::collections::HashSet::new();
+                    for bond in &obj.structure.bonds {
+                        let (a1, a2) = (bond.atom1, bond.atom2);
+                        if a1 >= atoms.len() || a2 >= atoms.len() { continue; }
+                        let (lig, poly) = if is_ligand_atom(a1) && !atoms[a2].is_hetatm {
+                            (a1, a2)
+                        } else if is_ligand_atom(a2) && !atoms[a1].is_hetatm {
+                            (a2, a1)
+                        } else {
+                            continue;
+                        };
+                        let rl = &atoms[lig].residue;
+                        let rp = &atoms[poly].residue;
+                        // Same-residue ATOM↔HETATM is handled by the normal path.
+                        if rl.chain == rp.chain && rl.seq_num == rp.seq_num && rl.ins_code == rp.ins_code {
+                            continue;
+                        }
+                        // Only when the ligand endpoint is actually shown.
+                        if obj.atom_rep_show.get(lig).copied().unwrap_or(0) & mask == 0 { continue; }
+                        keys.insert((rp.chain, rp.seq_num, rp.ins_code));
+                    }
+                    if keys.is_empty() {
+                        std::collections::HashSet::new()
+                    } else {
+                        atoms.iter().enumerate()
+                            .filter(|(_, a)| keys.contains(&(a.residue.chain, a.residue.seq_num, a.residue.ins_code)))
+                            .map(|(i, _)| i)
+                            .collect()
+                    }
+                } else {
+                    std::collections::HashSet::new()
+                };
+
                 // ── Ball-and-stick ────────────────────────────────────────────
                 for (i, atom) in atoms.iter().enumerate() {
                     let flags = obj.atom_rep_show.get(i).copied().unwrap_or(0);
                     if flags & (REP_BALL_STICK | REP_STICK) == 0 {
+                        // Covalent partner residue atoms are shown as sticks even
+                        // without a stored stick rep. Gate on "no stored stick
+                        // bit" so we never emit an atom's sphere twice.
+                        if covalent_partner_atoms.contains(&i) {
+                            let inst = SphereInstance {
+                                position: atom.position.to_array(),
+                                radius: STICK_RADIUS,
+                                color: colors[i],
+                                edge_boost: 0.0,
+                            };
+                            sphere_map.push((obj_name.clone(), i));
+                            spheres.push(inst);
+                        }
                         continue;
                     }
                     // Stick: uniform bond-radius spheres round the joints into a
@@ -1668,15 +1739,29 @@ impl RenderState {
                 for bond in &obj.structure.bonds {
                     let (a1, a2) = (bond.atom1, bond.atom2);
                     if a1 >= atoms.len() || a2 >= atoms.len() { continue; }
-                    let f1 = obj.atom_rep_show.get(a1).copied().unwrap_or(0);
-                    let f2 = obj.atom_rep_show.get(a2).copied().unwrap_or(0);
                     let mask = REP_BALL_STICK | REP_STICK;
+                    // Effective rep = stored flags OR REP_STICK for covalent
+                    // partner residue atoms (transient; atom_rep_show untouched).
+                    let mut f1 = obj.atom_rep_show.get(a1).copied().unwrap_or(0);
+                    let mut f2 = obj.atom_rep_show.get(a2).copied().unwrap_or(0);
+                    if covalent_partner_atoms.contains(&a1) { f1 |= REP_STICK; }
+                    if covalent_partner_atoms.contains(&a2) { f2 |= REP_STICK; }
                     if f1 & mask == 0 || f2 & mask == 0 { continue; }
+                    let mut is_covalent_link = false;
                     if atoms[a1].is_hetatm != atoms[a2].is_hetatm {
                         let same_residue = atoms[a1].residue.chain == atoms[a2].residue.chain
                             && atoms[a1].residue.seq_num == atoms[a2].residue.seq_num
                             && atoms[a1].residue.ins_code == atoms[a2].residue.ins_code;
-                        if !same_residue { continue; }
+                        if !same_residue {
+                            // Different-residue ATOM↔HETATM bonds are only drawn
+                            // when they are genuine covalent protein–ligand links
+                            // and highlighting is enabled — otherwise skip (old
+                            // behavior, byte-identical when show_covalent=false).
+                            let is_link = (is_ligand_atom(a1) && !atoms[a2].is_hetatm)
+                                || (is_ligand_atom(a2) && !atoms[a1].is_hetatm);
+                            if !(self.show_covalent && is_link) { continue; }
+                            is_covalent_link = true;
+                        }
                     }
                     let p1  = atoms[a1].position;
                     let p2  = atoms[a2].position;
@@ -1687,9 +1772,15 @@ impl RenderState {
                     let eb2 = if is_ligand_a2 { 1.0 } else { 0.0 };
                     // Stick bonds (both atoms stick-only, no ball) are thicker.
                     let stick_bond = (f1 & REP_BALL_STICK == 0) && (f2 & REP_BALL_STICK == 0);
-                    let radius = if stick_bond { STICK_RADIUS } else { BOND_RADIUS };
-                    let c1 = CylinderInstance::new(p1.to_array(), mid.to_array(), radius, colors[a1], eb1);
-                    let c2 = CylinderInstance::new(mid.to_array(), p2.to_array(), radius, colors[a2], eb2);
+                    // Covalent links are drawn thicker and gold on both halves.
+                    let (col1, col2, radius) = if is_covalent_link {
+                        (COVALENT_BOND_COLOR, COVALENT_BOND_COLOR, COVALENT_BOND_RADIUS)
+                    } else {
+                        let r = if stick_bond { STICK_RADIUS } else { BOND_RADIUS };
+                        (colors[a1], colors[a2], r)
+                    };
+                    let c1 = CylinderInstance::new(p1.to_array(), mid.to_array(), radius, col1, eb1);
+                    let c2 = CylinderInstance::new(mid.to_array(), p2.to_array(), radius, col2, eb2);
                     if is_ligand_a1 || is_ligand_a2 {
                         ligand_cylinders.push(c1);
                         ligand_cylinders.push(c2);
