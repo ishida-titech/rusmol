@@ -61,11 +61,10 @@ rusmol --headless -c "show surface; color chain; render fig.png, 2400; quit" 2je
 ### Headless mode
 
 `--headless` runs without opening a window or event loop: it applies the `-c`
-commands, writes any `render` / `png` output offscreen, and exits. It needs no
+commands, writes any `render` output offscreen, and exits. It needs no
 display server, so it works in scripts, batch jobs, and CI. It requires `-c`
-(there is nothing to do interactively). In headless mode `png` writes an
-offscreen image at the default 1000×1000 size; use `render <file>, W, H` for an
-explicit resolution.
+(there is nothing to do interactively). Use `render <file>, W, H` for an
+explicit resolution (defaults to 1000×1000).
 
 ---
 
@@ -285,15 +284,6 @@ set transparency, 0.5
 set surface_type, ses
 set surface_quality, 0.3
 set roughness, 0.6
-```
-
-### png / screenshot
-
-Save a screenshot of the current scene at the **window resolution** (fast; the
-egui toolbar is excluded).
-
-```
-png figure.png
 ```
 
 ### render

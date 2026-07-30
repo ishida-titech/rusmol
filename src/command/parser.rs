@@ -43,12 +43,6 @@ pub fn parse_command(input: &str) -> Result<Command, String> {
             let name = rest.trim();
             Ok(Command::Get { name: if name.is_empty() { None } else { Some(name.to_string()) } })
         }
-        "png" | "screenshot" => {
-            if rest.is_empty() {
-                return Err("png: expected a file path".into());
-            }
-            Ok(Command::Png { path: PathBuf::from(rest) })
-        }
         "render" => parse_render(rest),
         "docktrace" => parse_docktrace(rest),
         "help" | "h" | "?" => Ok(Command::Help),

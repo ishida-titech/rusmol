@@ -57,8 +57,6 @@ pub enum Command {
     SetColor { rep: String, color: Option<[f32; 3]>, sel: Option<String> },
     /// `get [name]` — show current parameter value(s)
     Get { name: Option<String> },
-    /// Save a screenshot as PNG: `png <filename>`
-    Png { path: PathBuf },
     /// High-resolution offline render to PNG: `render <file> [, W [, H]]`.
     /// W/H default to the current window size; supersampling from `set antialias`.
     Render { path: PathBuf, width: Option<u32>, height: Option<u32> },

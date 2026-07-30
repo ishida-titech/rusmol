@@ -393,9 +393,6 @@ pub struct RenderState {
     /// egui overlay renderer.
     pub egui_renderer: egui_wgpu::Renderer,
 
-    /// When set, the next render will capture the post-composite output to this path.
-    pub pending_screenshot: Option<std::path::PathBuf>,
-
     /// Supersampling factor for offline `render` export (1..=4). CPU-side only
     /// (not a shader uniform): the scene is rendered at `antialias`× resolution
     /// and box-downsampled. Default 2. Set via `set antialias, <1-4>`.
@@ -1632,7 +1629,6 @@ impl RenderState {
             bloom_down_bgl,
             bloom_blur_bgl,
             egui_renderer,
-            pending_screenshot: None,
             antialias: 2,
             bg_transparent: false,
             ssao_samples: 16,
@@ -2880,75 +2876,6 @@ impl RenderState {
         //    swapchain view. Shared with the offline export path.
         self.record_scene(&mut encoder, &self.targets, &output_view);
 
-        // ── Screenshot capture (between post-composite and egui) ─────────────
-        // Re-run the post-composite pass to a separate COPY_SRC texture so we
-        // capture the final image without egui UI overlay.
-        let screenshot_staging = if self.pending_screenshot.is_some() {
-            let w = self.config.width;
-            let h = self.config.height;
-            let capture_tex = self.device.create_texture(&wgpu::TextureDescriptor {
-                label: Some("ScreenshotCapture"),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: self.config.format,
-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-                view_formats: &[],
-            });
-            let capture_view = capture_tex.create_view(&Default::default());
-            {
-                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("ScreenshotPostPass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &capture_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    ..Default::default()
-                });
-                pass.set_pipeline(&self.post_pipeline);
-                pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                pass.set_bind_group(1, &self.targets.post_bg, &[]);
-                pass.draw(0..3, 0..1);
-            }
-
-            let bytes_per_pixel = 4u32;
-            let unpadded_bytes_per_row = w * bytes_per_pixel;
-            let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
-            let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) / align * align;
-            let staging_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("ScreenshotStaging"),
-                size: (padded_bytes_per_row * h) as u64,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &capture_tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &staging_buf,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(padded_bytes_per_row),
-                        rows_per_image: None,
-                    },
-                },
-                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-            );
-            Some((staging_buf, w, h, padded_bytes_per_row, unpadded_bytes_per_row))
-        } else {
-            None
-        };
-
         // ── Pass 6: egui overlay ──────────────────────────────────────────────
         {
             let mut pass = encoder
@@ -2975,61 +2902,6 @@ impl RenderState {
         // Release egui textures that are no longer needed.
         for id in &textures_delta.free {
             self.egui_renderer.free_texture(id);
-        }
-
-        // ── Screenshot readback & save ────────────────────────────────────────
-        if let (Some((staging_buf, w, h, padded_bpr, unpadded_bpr)), Some(path)) =
-            (screenshot_staging, self.pending_screenshot.take())
-        {
-            let slice = staging_buf.slice(..);
-            let (tx, rx) = std::sync::mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |result| {
-                let _ = tx.send(result);
-            });
-            self.device.poll(wgpu::Maintain::Wait);
-            match rx.recv() {
-                Ok(Ok(())) => {
-                    let data = slice.get_mapped_range();
-                    // The capture texture uses the swapchain format, which is
-                    // BGRA-ordered on Metal but RGBA-ordered on many Vulkan
-                    // (Linux) adapters. Swap red/blue only for BGRA formats so
-                    // the saved PNG is correct on every backend.
-                    let swap_rb = matches!(
-                        self.config.format,
-                        wgpu::TextureFormat::Bgra8UnormSrgb | wgpu::TextureFormat::Bgra8Unorm
-                    );
-                    let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-                    for row in 0..h {
-                        let offset = (row * padded_bpr) as usize;
-                        let row_data = &data[offset..offset + unpadded_bpr as usize];
-                        for pixel in row_data.chunks_exact(4) {
-                            if swap_rb {
-                                rgba.push(pixel[2]); // R
-                                rgba.push(pixel[1]); // G
-                                rgba.push(pixel[0]); // B
-                                rgba.push(pixel[3]); // A
-                            } else {
-                                rgba.extend_from_slice(pixel); // already RGBA
-                            }
-                        }
-                    }
-                    drop(data);
-                    staging_buf.unmap();
-
-                    match image::RgbaImage::from_raw(w, h, rgba) {
-                        Some(img) => {
-                            if let Err(e) = img.save(&path) {
-                                eprintln!("png: failed to save '{}': {e}", path.display());
-                            } else {
-                                println!("Saved screenshot: {} ({}×{})", path.display(), w, h);
-                            }
-                        }
-                        None => eprintln!("png: failed to create image buffer"),
-                    }
-                }
-                Ok(Err(e)) => eprintln!("png: buffer map failed: {e}"),
-                Err(_) => eprintln!("png: buffer map channel closed"),
-            }
         }
 
         Ok(())

@@ -16,7 +16,7 @@ After loading one or more structures, RusMol opens a 3D window and an interactiv
 Examples:
   rusmol protein.pdb
   rusmol receptor.pdbqt ligand.pdbqt
-  rusmol complex.pdb -c \"show surface; color chain; png out.png; quit\"")]
+  rusmol complex.pdb -c \"show surface; color chain; render out.png; quit\"")]
 pub struct Cli {
     /// Molecular structure file(s) to load (PDB / PDBQT)
     pub files: Vec<PathBuf>,

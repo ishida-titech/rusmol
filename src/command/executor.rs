@@ -290,7 +290,6 @@ pub fn execute(cmd: Command, scene: &mut Scene, camera: &mut Camera) -> (Command
         Command::Set { .. }    => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
         Command::SetColor { .. } => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
         Command::Get { .. }   => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
-        Command::Png { .. } => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
         Command::Render { .. } => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
         Command::DockTrace { .. } => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
         Command::DockTraceNav(_) => (CommandResponse::Ok(String::new()), SceneDirty::NONE),
@@ -397,7 +396,6 @@ fn help_text() -> String {
    get <name>                    Show the value of one parameter
 
  Image export
-   png <filename>                Save a screenshot as PNG (window resolution)
    render <file> [, W [, H]]     High-res offline render (default: window size,
                                  supersampled by `set antialias`)
 

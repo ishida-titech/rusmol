@@ -30,8 +30,7 @@ sub-second cold start, built on [wgpu](https://wgpu.rs/).
   sticks + ligand–protein H-bonds), and Pocket Surface.
 - **Docking trace playback** — step through an AutoDock-style optimization
   trajectory (`docktrace`).
-- **PNG export** — `png <file>` for a quick window-resolution screenshot, or
-  `render <file> [, W [, H]]` for high-resolution, supersampled
+- **PNG export** — `render <file> [, W [, H]]` for high-resolution, supersampled
   **publication figures** with optional transparent background and depth of
   field.
 - **File formats** — PDB and PDBQT.
@@ -117,7 +116,7 @@ rusmol tests/dock_trace/receptor.pdbqt tests/dock_trace/ligand.pdbqt \
 
 # Fully scripted, headless-style: render to PNG and quit
 rusmol tests/fixtures/2je5.pdb \
-  -c "show surface; color chain; bg white; png out.png; quit"
+  -c "show surface; color chain; bg white; render out.png; quit"
 
 # High-resolution publication figure (3x supersampled, 2400x2400)
 rusmol tests/fixtures/2je5.pdb \
@@ -160,7 +159,7 @@ Options:
 ### Headless rendering
 
 With `--headless`, RusMol never opens a window or event loop — it runs the
-`-c` commands, writes any `render`/`png` outputs offscreen, and exits. This is
+`-c` commands, writes any `render` outputs offscreen, and exits. This is
 ideal for scripts, batch figure generation, and servers/CI without a display:
 
 ```sh
@@ -168,8 +167,8 @@ rusmol --headless tests/fixtures/2je5.pdb \
   -c "show surface; color chain; bg white; set antialias,3; render figure.png, 2400; quit"
 ```
 
-`--headless` requires `-c`. In this mode `png` writes an offscreen image at the
-default 1000×1000 size (use `render` for an explicit resolution).
+`--headless` requires `-c`. Use `render` to write output at an explicit
+resolution (defaults to 1000×1000).
 
 ## Sample data
 

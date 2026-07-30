@@ -52,12 +52,8 @@ pub struct App {
     egui_ctx:   egui::Context,
     egui_winit: Option<egui_winit::State>,
 
-    /// Deferred quit: wait for pending_screenshot to complete before exiting.
+    /// Deferred quit: honored in about_to_wait after pending_render is consumed.
     pending_quit: bool,
-
-    /// Deferred screenshot path: transferred to render.pending_screenshot in
-    /// about_to_wait AFTER scene re-upload, so the capture reflects -c changes.
-    pending_screenshot_path: Option<std::path::PathBuf>,
 
     /// Deferred high-res `render` export: (path, width, height). Executed in
     /// about_to_wait AFTER scene re-upload (and before quit) via RenderState::export.
@@ -91,7 +87,6 @@ impl App {
             egui_ctx:   egui::Context::default(),
             egui_winit: None,
             pending_quit: false,
-            pending_screenshot_path: None,
             pending_render: None,
             dock_trace: None,
         }
@@ -151,9 +146,10 @@ impl ApplicationHandler for App {
     /// and display connection are still valid. We terminate the process here
     /// instead of letting `run_app` return and drop the App: on Linux/Vulkan,
     /// tearing down the wgpu surface/device after winit has closed the X11 or
-    /// Wayland connection segfaults inside the driver. Any deferred screenshot
-    /// has already been written to disk by the time `exit()` was requested, so
-    /// skipping destructors here is safe (the OS reclaims all resources).
+    /// Wayland connection segfaults inside the driver. Any deferred render
+    /// export has already been written to disk by the time `exit()` was
+    /// requested, so skipping destructors here is safe (the OS reclaims all
+    /// resources).
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         std::process::exit(0);
     }
@@ -548,14 +544,6 @@ impl ApplicationHandler for App {
                     continue;
                 }
 
-                if let Command::Png { path } = cmd {
-                    self.pending_screenshot_path = Some(path);
-                    if let Some(tx) = &self.resp_tx {
-                        let _ = tx.send(crate::command::CommandResponse::Ok(String::new()));
-                    }
-                    continue;
-                }
-
                 if let Command::Render { path, width, height } = cmd {
                     self.pending_render = Some((path, width, height));
                     if let Some(tx) = &self.resp_tx {
@@ -599,14 +587,6 @@ impl ApplicationHandler for App {
             self.scene_dirty = SceneDirty::NONE;
         }
 
-        // Transfer deferred screenshot to render AFTER scene re-upload
-        if let Some(path) = self.pending_screenshot_path.take() {
-            if let AppState::Running { render, window, .. } = &mut self.state {
-                render.pending_screenshot = Some(path);
-                window.request_redraw();
-            }
-        }
-
         // Execute deferred high-res render AFTER scene re-upload. This runs
         // synchronously (export blocks on the readback), so it completes before
         // any pending quit is honored below.
@@ -626,18 +606,10 @@ impl ApplicationHandler for App {
             self.pending_quit = true;
         }
 
-        // Deferred quit: wait until pending_screenshot is consumed
+        // Quit now that any pending_render (synchronous export above) is done.
         if self.pending_quit {
-            let screenshot_done = match &self.state {
-                AppState::Running { render, .. } => render.pending_screenshot.is_none(),
-                _ => true,
-            };
-            if screenshot_done {
-                event_loop.exit();
-                return;
-            } else if let AppState::Running { window, .. } = &self.state {
-                window.request_redraw();
-            }
+            event_loop.exit();
+            return;
         }
 
     }
@@ -695,9 +667,8 @@ impl App {
             Ok(cmd) => {
                 let AppState::Running { render, camera, window } = &mut self.state else { return };
                 match apply_command(cmd, &mut self.scene, render, camera, &mut self.scene_dirty) {
-                    // Quit via -c: defer to about_to_wait so screenshots can complete
+                    // Quit via -c: defer to about_to_wait so a pending render completes
                     CmdOutcome::Quit => self.pending_quit = true,
-                    CmdOutcome::Screenshot(path) => self.pending_screenshot_path = Some(path),
                     CmdOutcome::Render(path, w, h) => self.pending_render = Some((path, w, h)),
                     CmdOutcome::Handled => window.request_redraw(),
                     CmdOutcome::Printed(response) => match response {
@@ -1232,7 +1203,7 @@ fn apply_pocket_surface_view(scene: &mut Scene) {
 ///
 /// The side-effect logic (mutating `render.*` fields, colors, scene geometry
 /// flags) lives in `apply_command`; the *I/O* consequences (printing, deferring
-/// a screenshot/render, requesting a quit) are returned here so each caller —
+/// a render, requesting a quit) are returned here so each caller —
 /// the windowed `run_command_line` and the headless runner — can perform them in
 /// the way appropriate to its context.
 pub enum CmdOutcome {
@@ -1240,8 +1211,6 @@ pub enum CmdOutcome {
     Handled,
     /// A `quit` was issued.
     Quit,
-    /// A `png` screenshot was requested at the given path.
-    Screenshot(std::path::PathBuf),
     /// A `render` export was requested: (path, width, height).
     Render(std::path::PathBuf, Option<u32>, Option<u32>),
     /// A generic command ran through the executor and produced a response to print.
@@ -1363,7 +1332,6 @@ pub fn apply_command(
             *scene_dirty |= dirty_for_set_color(rep);
             CmdOutcome::Handled
         }
-        Command::Png { path } => CmdOutcome::Screenshot(path),
         Command::Render { path, width, height } => CmdOutcome::Render(path, width, height),
         other => {
             let (response, dirty) = executor::execute(other, scene, camera);

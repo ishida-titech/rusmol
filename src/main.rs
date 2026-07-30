@@ -124,7 +124,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Headless (no-window) runner. Builds an offscreen [`RenderState`], applies the
-/// `-c` commands via the shared [`app::apply_command`], writes any `render`/`png`
+/// `-c` commands via the shared [`app::apply_command`], writes any `render`
 /// outputs to disk, then returns. Never touches winit, so it works with no
 /// display server.
 fn run_headless(mut scene: Scene, initial_commands: Vec<String>) -> anyhow::Result<()> {
@@ -150,7 +150,7 @@ fn run_headless(mut scene: Scene, initial_commands: Vec<String>) -> anyhow::Resu
 
     let mut scene_dirty = SceneDirty::NONE;
 
-    // Flush any pending geometry changes before an export/screenshot so the
+    // Flush any pending geometry changes before an export so the
     // capture reflects all preceding commands.
     let flush = |render: &mut RenderState, scene: &Scene, dirty: &mut SceneDirty| {
         if !dirty.is_empty() {
@@ -183,14 +183,6 @@ fn run_headless(mut scene: Scene, initial_commands: Vec<String>) -> anyhow::Resu
                 let out_h = h.or(w).unwrap_or(1000);
                 if let Err(e) = render.export(&mut camera, out_w, out_h, &path) {
                     eprintln!("render: {e}");
-                }
-            }
-            CmdOutcome::Screenshot(path) => {
-                flush(&mut render, &scene, &mut scene_dirty);
-                // No swapchain in headless: `png` exports at the config size.
-                let (w, h) = (render.config.width, render.config.height);
-                if let Err(e) = render.export(&mut camera, w, h, &path) {
-                    eprintln!("png: {e}");
                 }
             }
         }

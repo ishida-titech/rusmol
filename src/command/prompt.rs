@@ -35,7 +35,7 @@ impl Validator for RusmolHelper {}
 const COMMANDS: &[&str] = &[
     "load", "select", "show", "hide", "color", "enable", "disable", "delete",
     "zoom", "reset", "bg", "light", "light2", "set", "get", "docktrace",
-    "png", "render", "help", "quit",
+    "render", "help", "quit",
 ];
 
 /// Representation names for show/hide.
