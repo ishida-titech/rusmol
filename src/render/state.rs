@@ -31,7 +31,7 @@ const STICK_RADIUS: f32 = BOND_RADIUS * 2.5;
 /// Gold/yellow highlight for auto-detected covalent protein–ligand links.
 const COVALENT_BOND_COLOR: [f32; 3] = [1.0, 0.82, 0.10];
 /// Covalent link bonds are drawn thicker than normal sticks.
-const COVALENT_BOND_RADIUS: f32 = STICK_RADIUS * 1.5;
+const COVALENT_BOND_RADIUS: f32 = BOND_RADIUS * 1.3;
 const BACKBONE_TUBE_RADIUS: f32 = 0.30;
 const BACKBONE_JOINT_RADIUS: f32 = 0.36;
 const SHADOW_MAP_SIZE: u32 = 2048;
@@ -1835,17 +1835,31 @@ impl RenderState {
                     let is_ligand_a2 = atoms[a2].is_hetatm && !matches!(atoms[a2].residue.name.as_str(), "HOH" | "WAT" | "DOD");
                     let eb1 = if is_ligand_a1 { 1.0 } else { 0.0 };
                     let eb2 = if is_ligand_a2 { 1.0 } else { 0.0 };
+                    // Covalent protein–ligand link: one slim gold cylinder.
+                    // Inset the ligand end to the atom's ball surface so the ligand
+                    // atom stays fully visible instead of being swallowed, and keep
+                    // it slim so it reads as a highlight rather than a fat barrel.
+                    if is_covalent_link {
+                        let (p_lig, p_pro, lig_idx) = if is_ligand_a1 {
+                            (p1, p2, a1)
+                        } else {
+                            (p2, p1, a2)
+                        };
+                        let dir = (p_pro - p_lig).normalize_or_zero();
+                        let ball = (vdw_radius(&atoms[lig_idx].element) * 0.22)
+                            .min((p_pro - p_lig).length() * 0.5);
+                        let start = p_lig + dir * ball;
+                        ligand_cylinders.push(CylinderInstance::new(
+                            start.to_array(), p_pro.to_array(),
+                            COVALENT_BOND_RADIUS, COVALENT_BOND_COLOR, 1.0,
+                        ));
+                        continue;
+                    }
                     // Stick bonds (both atoms stick-only, no ball) are thicker.
                     let stick_bond = (f1 & REP_BALL_STICK == 0) && (f2 & REP_BALL_STICK == 0);
-                    // Covalent links are drawn thicker and gold on both halves.
-                    let (col1, col2, radius) = if is_covalent_link {
-                        (COVALENT_BOND_COLOR, COVALENT_BOND_COLOR, COVALENT_BOND_RADIUS)
-                    } else {
-                        let r = if stick_bond { STICK_RADIUS } else { BOND_RADIUS };
-                        (colors[a1], colors[a2], r)
-                    };
-                    let c1 = CylinderInstance::new(p1.to_array(), mid.to_array(), radius, col1, eb1);
-                    let c2 = CylinderInstance::new(mid.to_array(), p2.to_array(), radius, col2, eb2);
+                    let r = if stick_bond { STICK_RADIUS } else { BOND_RADIUS };
+                    let c1 = CylinderInstance::new(p1.to_array(), mid.to_array(), r, colors[a1], eb1);
+                    let c2 = CylinderInstance::new(mid.to_array(), p2.to_array(), r, colors[a2], eb2);
                     if is_ligand_a1 || is_ligand_a2 {
                         ligand_cylinders.push(c1);
                         ligand_cylinders.push(c2);
